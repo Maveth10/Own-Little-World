@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { Upload } from 'lucide-react';
+import { Upload, Folder, FileText, RefreshCw, X, CheckCircle } from 'lucide-react';
 import { createClient } from '@supabase/supabase-js';
 
 function getSupabase() {
@@ -14,119 +14,343 @@ function getSupabase() {
 export default function TeachAI() {
   const [title, setTitle] = useState('');
   const [content, setContent] = useState('');
-  const [file, setFile] = useState(null);
+  const [files, setFiles] = useState([]);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
   const [status, setStatus] = useState('');
+  const [stats, setStats] = useState({ current: 0, total: 0, success: 0, skipped: 0, failed: 0 });
 
-  const handleSave = async () => {
-    if (!title && !content && !file) {
-      setStatus('❌ Musisz dodać chociaż notatkę, tytuł lub plik!');
+  // Rekursywne skanowanie folderów i plików w Drag & Drop
+  const scanEntry = async (entry) => {
+    if (entry.isFile) {
+      return new Promise((resolve) => {
+        entry.file((file) => resolve([file]));
+      });
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      const entries = await new Promise((resolve) => {
+        reader.readEntries((results) => resolve(results));
+      });
+      const nestedFiles = await Promise.all(entries.map((e) => scanEntry(e)));
+      return nestedFiles.flat();
+    }
+    return [];
+  };
+
+  // Obsługa upuszczenia plików/folderów na boks (Drag & Drop)
+  const handleDrop = async (e) => {
+    e.preventDefault();
+    setIsDragging(false);
+
+    const items = e.dataTransfer.items;
+    if (!items) return;
+
+    setStatus('🔍 Skanowanie przeciągniętej zawartości...');
+    let extractedFiles = [];
+
+    for (let i = 0; i < items.length; i++) {
+      const entry = items[i].webkitGetAsEntry ? items[i].webkitGetAsEntry() : null;
+      if (entry) {
+        const scanned = await scanEntry(entry);
+        extractedFiles.push(...scanned);
+      } else if (items[i].kind === 'file') {
+        extractedFiles.push(items[i].getAsFile());
+      }
+    }
+
+    const validFiles = extractedFiles.filter(
+      (f) => f && (f.type.startsWith('image/') || f.type === 'application/pdf' || f.name.endsWith('.pdf'))
+    );
+
+    setFiles((prev) => [...prev, ...validFiles]);
+    setStatus(`📁 Wykryto i dodano ${validFiles.length} prawidłowych plików.`);
+  };
+
+  // Obsługa tradycyjnego wyboru przez okno plików/folderów
+  const handleFileSelection = (e) => {
+    if (e.target.files) {
+      const selected = Array.from(e.target.files).filter(
+        (f) => f.type.startsWith('image/') || f.type === 'application/pdf' || f.name.endsWith('.pdf')
+      );
+      setFiles((prev) => [...prev, ...selected]);
+      setStatus(`📁 Wybrano ${selected.length} plików.`);
+    }
+  };
+
+  const removeFile = (index) => {
+    setFiles((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  const handleBatchSave = async () => {
+    if (files.length === 0 && !title && !content) {
+      setStatus('❌ Wybierz pliki, folder lub wprowadź notatkę!');
       return;
     }
 
-    try {
-      let fileUrl = null;
-      let fileName = '';
-      let fileType = '';
+    setIsProcessing(true);
+    const supabase = getSupabase();
 
-      if (file) {
-        setStatus('⏳ Wysyłanie pliku do magazynu Supabase Storage...');
-        const supabase = getSupabase();
-        const safeName = file.name.replace(/[^a-zA-Z0-9.-]/g, '');
-        fileName = `${Date.now()}_${safeName}`;
-        fileType = file.type || (file.name.endsWith('.pdf') ? 'application/pdf' : 'image/jpeg');
+    // DLA SAMESO TEKSTU
+    if (files.length === 0) {
+      setStatus('⏳ Przetwarzanie notatki tekstowej...');
+      try {
+        const res = await fetch('/api/teach', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title, content }),
+        });
+        const data = await res.json();
+        if (data.success) {
+          setStatus(`✅ Sukces! ${data.message}`);
+          setTitle('');
+          setContent('');
+        } else {
+          setStatus('❌ Błąd API: ' + data.error);
+        }
+      } catch (err) {
+        setStatus('❌ Błąd wysyłania notatki.');
+      }
+      setIsProcessing(false);
+      return;
+    }
+
+    // MASOWA OBSŁUGA PLIKÓW/FOLDERÓW
+    setStatus('🔍 Pobieranie listy plików z bazy do sprawdzenia duplikatów...');
+    let existingStorageFiles = [];
+    try {
+      const { data } = await supabase.storage.from('schematics').list('', { limit: 1000 });
+      if (data) existingStorageFiles = data.map((f) => f.name.toLowerCase());
+    } catch (err) {
+      console.warn('Nie udało się pobrać listy do deduplikacji:', err);
+    }
+
+    let successCount = 0;
+    let skippedCount = 0;
+    let failedCount = 0;
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const safeName = file.name.replace(/[^a-zA-Z0-9.-]/g, '');
+
+      // Sprawdzenie duplikatu
+      const isDuplicate = existingStorageFiles.some((existing) =>
+        existing.endsWith(safeName.toLowerCase())
+      );
+
+      if (isDuplicate) {
+        skippedCount++;
+        setStats({
+          current: i + 1,
+          total: files.length,
+          success: successCount,
+          skipped: skippedCount,
+          failed: failedCount,
+        });
+        setStatus(`⏭️ [${i + 1}/${files.length}] Pominięto duplikat: ${file.name}`);
+        await new Promise((r) => setTimeout(r, 150));
+        continue;
+      }
+
+      try {
+        setStatus(`⏳ [${i + 1}/${files.length}] Wysyłanie: ${file.name}...`);
+        const fileName = `${Date.now()}_${safeName}`;
+        const fileType = file.type || (file.name.endsWith('.pdf') ? 'application/pdf' : 'image/jpeg');
 
         const { error: uploadError } = await supabase.storage
           .from('schematics')
           .upload(fileName, file, { contentType: fileType, upsert: true });
 
-        if (uploadError) {
-          throw new Error(`Błąd wgrywania pliku do Supabase: ${uploadError.message}`);
+        if (uploadError) throw new Error(uploadError.message);
+
+        const fileUrl = supabase.storage.from('schematics').getPublicUrl(fileName).data.publicUrl;
+        existingStorageFiles.push(fileName.toLowerCase());
+
+        setStatus(`🧠 [${i + 1}/${files.length}] Analiza AI: ${file.name}...`);
+
+        const res = await fetch('/api/teach', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: title ? `${title} (${file.name})` : file.name,
+            content,
+            fileUrl,
+            fileName: file.name,
+            fileType,
+          }),
+        });
+
+        const rawText = await res.text();
+        let data;
+        try {
+          data = JSON.parse(rawText);
+        } catch {
+          data = { success: false };
         }
 
-        fileUrl = supabase.storage.from('schematics').getPublicUrl(fileName).data.publicUrl;
+        if (data.success) {
+          successCount++;
+        } else {
+          failedCount++;
+        }
+      } catch (err) {
+        console.error(`Błąd przetwarzania ${file.name}:`, err);
+        failedCount++;
       }
 
-      setStatus('⏳ Przetwarzanie dokumentu przez AI (Analiza i wektoryzacja)...');
-
-      const res = await fetch('/api/teach', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          title,
-          content,
-          fileUrl,
-          fileName: file ? file.name : '',
-          fileType
-        }),
+      setStats({
+        current: i + 1,
+        total: files.length,
+        success: successCount,
+        skipped: skippedCount,
+        failed: failedCount,
       });
 
-      const data = await res.json();
-
-      if (data.success) {
-        setStatus(`✅ Sukces! ${data.message}`);
-        setTitle('');
-        setContent('');
-        setFile(null);
-      } else {
-        setStatus('❌ Błąd API: ' + data.error);
-      }
-    } catch (error) {
-      console.error(error);
-      setStatus('❌ Błąd: ' + (error.message || 'Problem z połączeniem.'));
+      await new Promise((r) => setTimeout(r, 1000));
     }
+
+    setStatus(
+      `🎉 Zakończono! Zapisano nowych: ${successCount}, Pominięto duplikatów: ${skippedCount}, Błędy: ${failedCount}`
+    );
+    setIsProcessing(false);
+    setFiles([]);
+    setTitle('');
+    setContent('');
   };
 
   return (
-    <div className="p-8 max-w-2xl mx-auto font-sans">
+    <div className="p-8 max-w-3xl mx-auto font-sans">
       <h1 className="text-3xl font-bold mb-2">Panel Głównego Inżyniera</h1>
       <p className="text-gray-600 mb-8">
-        Wgraj dokumentację PDF lub zdjęcie. AI przeanalizuje treść, podzieli dane i wygeneruje punkty odniesienia.
+        Upuść plik, grupę plików lub cały folder. AI przeanalizuje dokumentację i powiąże dane.
       </p>
 
       <div className="flex flex-col gap-5">
         <input
           type="text"
-          placeholder="Tytuł (opcjonalnie)"
+          placeholder="Domyślny tytuł / prefiks (opcjonalnie)"
           value={title}
+          disabled={isProcessing}
           onChange={(e) => setTitle(e.target.value)}
           className="p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-yellow-400 outline-none"
         />
 
         <textarea
-          placeholder="Notatki / uwagi serwisowe (opcjonalnie)..."
+          placeholder="Uwagi serwisowe / notatka ogólna (opcjonalnie)..."
           value={content}
+          disabled={isProcessing}
           onChange={(e) => setContent(e.target.value)}
-          className="p-3 border border-gray-300 rounded-lg h-40 focus:ring-2 focus:ring-yellow-400 outline-none"
+          className="p-3 border border-gray-300 rounded-lg h-24 focus:ring-2 focus:ring-yellow-400 outline-none"
         />
 
-        <div className="border-2 border-dashed border-gray-300 rounded-xl p-8 flex flex-col items-center justify-center bg-gray-50 hover:bg-gray-100 transition-colors">
-          <Upload className="text-gray-400 mb-3" size={36} />
-          <label className="cursor-pointer text-yellow-600 font-bold hover:underline text-lg">
-            Wybierz plik (PDF lub Obraz)
-            <input
-              type="file"
-              accept="image/*,application/pdf"
-              className="hidden"
-              onChange={(e) => setFile(e.target.files ? e.target.files[0] : null)}
-            />
-          </label>
-          {file && (
-            <p className="text-md text-green-600 font-bold mt-4 break-all text-center">
-              Wybrano: {file.name} ({(file.size / 1024 / 1024).toFixed(2)} MB)
-            </p>
-          )}
+        {/* INTELIGENTNY BOKS ZRZUTU (SMART DROPZONE) */}
+        <div
+          onDragOver={(e) => {
+            e.preventDefault();
+            setIsDragging(true);
+          }}
+          onDragLeave={() => setIsDragging(false)}
+          onDrop={handleDrop}
+          className={`border-2 border-dashed rounded-2xl p-8 flex flex-col items-center justify-center transition-all ${
+            isDragging
+              ? 'border-yellow-500 bg-yellow-50 scale-[1.01]'
+              : 'border-gray-300 bg-gray-50 hover:bg-gray-100'
+          }`}
+        >
+          <Upload className={`mb-3 transition-transform ${isDragging ? 'scale-125 text-yellow-600' : 'text-gray-400'}`} size={40} />
+          
+          <p className="text-lg font-bold text-gray-800 text-center">
+            Przeciągnij i upuść tutaj dowolne pliki lub cały folder
+          </p>
+          <p className="text-xs text-gray-500 mt-1 mb-4 text-center">
+            System automatycznie przeskanuje zawartość i wykryje pliki PDF oraz zdjęcia.
+          </p>
+
+          <div className="flex flex-wrap gap-3 justify-center">
+            <label className="cursor-pointer bg-white border border-gray-300 hover:border-gray-400 text-gray-700 font-semibold px-4 py-2 rounded-lg shadow-sm text-sm flex items-center gap-2 transition-all">
+              <FileText size={16} className="text-yellow-600" />
+              Wybierz Plik(i)
+              <input
+                type="file"
+                multiple
+                accept="image/*,application/pdf"
+                className="hidden"
+                disabled={isProcessing}
+                onChange={handleFileSelection}
+              />
+            </label>
+
+            <label className="cursor-pointer bg-white border border-gray-300 hover:border-gray-400 text-gray-700 font-semibold px-4 py-2 rounded-lg shadow-sm text-sm flex items-center gap-2 transition-all">
+              <Folder size={16} className="text-yellow-600" />
+              Wybierz Folder
+              <input
+                type="file"
+                webkitdirectory="true"
+                directory=""
+                className="hidden"
+                disabled={isProcessing}
+                onChange={handleFileSelection}
+              />
+            </label>
+          </div>
         </div>
 
+        {/* LISTA PODGLĄDU PLIKÓW */}
+        {files.length > 0 && (
+          <div className="p-4 bg-gray-100 rounded-xl border border-gray-200">
+            <div className="flex justify-between items-center mb-2">
+              <p className="font-bold text-gray-800">
+                Kolejka ({files.length} plików):
+              </p>
+              <button
+                onClick={() => setFiles([])}
+                disabled={isProcessing}
+                className="text-xs text-red-600 hover:underline font-semibold"
+              >
+                Wyczyść listę
+              </button>
+            </div>
+            <ul className="max-h-40 overflow-y-auto text-sm text-gray-600 space-y-1 pr-1">
+              {files.map((f, idx) => (
+                <li key={idx} className="flex justify-between items-center bg-white p-2 rounded border border-gray-200 truncate">
+                  <span className="truncate flex-1 font-mono text-xs">• {f.name} ({(f.size / 1024 / 1024).toFixed(2)} MB)</span>
+                  {!isProcessing && (
+                    <button onClick={() => removeFile(idx)} className="text-gray-400 hover:text-red-600 ml-2">
+                      <X size={14} />
+                    </button>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {/* PRZYCISK URUCHOMIENIA */}
         <button
-          onClick={handleSave}
-          disabled={!title && !content && !file}
-          className="p-4 bg-black text-white font-bold text-lg rounded-xl hover:bg-gray-800 transition-colors disabled:bg-gray-400"
+          onClick={handleBatchSave}
+          disabled={isProcessing || (files.length === 0 && !title && !content)}
+          className="p-4 bg-black text-white font-bold text-lg rounded-xl hover:bg-gray-800 transition-colors disabled:bg-gray-400 flex items-center justify-center gap-2 shadow-md"
         >
-          Przeanalizuj i Zapisz w Pamięci AI
+          {isProcessing ? (
+            <>
+              <RefreshCw className="animate-spin" size={20} />
+              Analizowanie... ({stats.current}/{stats.total})
+            </>
+          ) : (
+            'Uruchom Analizę i Zapis w Pamięci AI'
+          )}
         </button>
 
+        {/* STATUS */}
         {status && (
-          <div className={`mt-4 font-bold text-center text-lg p-4 rounded-lg border ${status.includes('❌') ? 'bg-red-50 text-red-800 border-red-200' : 'bg-white text-gray-800 border-gray-100'}`}>
+          <div
+            className={`mt-2 font-bold text-center text-base p-4 rounded-lg border ${
+              status.includes('❌')
+                ? 'bg-red-50 text-red-800 border-red-200'
+                : status.includes('🎉')
+                ? 'bg-green-50 text-green-800 border-green-200'
+                : 'bg-white text-gray-800 border-gray-200 shadow-sm'
+            }`}
+          >
             {status}
           </div>
         )}
