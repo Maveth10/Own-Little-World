@@ -49,8 +49,7 @@ async function getEmbedding(text) {
 }
 
 // -------------------------------------------------------------------------
-// NOWOŚĆ: PRE-SKANER OCR (Agentic RAG)
-// Szybki skan zdjęcia, by wyciągnąć słowa kluczowe przed szukaniem w Supabase
+// PRE-SKANER OCR (Szybki skan wizyjny obrazu przed szukaniem w bazie)
 // -------------------------------------------------------------------------
 async function extractKeywordsFromImage(base64Data, mimeType, apiKey) {
   try {
@@ -80,7 +79,7 @@ async function extractKeywordsFromImage(base64Data, mimeType, apiKey) {
   return "";
 }
 
-// INTELIGENTNA ROTACJA MODELI GOOGLE GEMINI
+// INTELIGENTNA ROTACJA MODELI GOOGLE GEMINI Z WIZJĄ
 async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
   let availableModels = [
     "gemini-2.0-flash", 
@@ -196,30 +195,23 @@ export async function POST(req) {
       return NextResponse.json({ error: "Brak pytania." }, { status: 400 });
     }
 
-    // -------------------------------------------------------------------------
-    // PRE-SKANOWANIE WIZYJNE
-    // -------------------------------------------------------------------------
     let enhancedSearchQuery = lastUserMessage;
     const lastMsgObj = messages.length > 0 ? messages[messages.length - 1] : null;
 
     if (lastMsgObj && lastMsgObj.inlineData && process.env.GEMINI_API_KEY) {
-      console.log("📸 Wykryto obraz! Uruchamiam zwiadowcę OCR...");
       const keywords = await extractKeywordsFromImage(
         lastMsgObj.inlineData.data, 
         lastMsgObj.inlineData.mimeType, 
         process.env.GEMINI_API_KEY
       );
-      
       if (keywords && keywords.length > 2) {
-        console.log("✅ Znaleziono tekst na zdjęciu:", keywords);
-        // Doklejamy znalezione symbole do zapytania dla Supabase!
         enhancedSearchQuery = `${lastUserMessage} ${keywords}`; 
       }
     }
 
     let contextChunks = [];
 
-    // UŻYWAMY WZBOGACONEGO ZAPYTANIA
+    // 1. GŁÓWNE WYSZUKIWANIE WEKTOROWE
     const queryEmbedding = await getEmbedding(enhancedSearchQuery);
 
     if (queryEmbedding) {
@@ -227,7 +219,7 @@ export async function POST(req) {
         const { data: vectorData } = await supabase.rpc('match_ai_memory', {
           query_embedding: queryEmbedding,
           match_threshold: 0.01,
-          match_count: 20
+          match_count: 15
         });
 
         if (vectorData && vectorData.length > 0) {
@@ -238,7 +230,7 @@ export async function POST(req) {
       }
     }
 
-    // WYSZUKIWANIE TEKSTOWE NA WZBOGACONYM ZAPYTANIU
+    // 2. GŁÓWNE WYSZUKIWANIE TEKSTOWE
     const cleanTerms = enhancedSearchQuery
       .replace(/[^a-zA-Z0-9.-]/g, ' ')
       .split(' ')
@@ -250,7 +242,7 @@ export async function POST(req) {
           .from('ai_memory')
           .select('*')
           .or(`title.ilike.%${term}%,content.ilike.%${term}%`)
-          .limit(20);
+          .limit(15);
 
         if (searchResults && searchResults.length > 0) {
           contextChunks.push(...searchResults);
@@ -260,13 +252,47 @@ export async function POST(req) {
       console.warn("Błąd wyszukiwania słów kluczowych:", err.message);
     }
 
+    // -------------------------------------------------------------------------
+    // KROK 2.5: MULTI-HOP RAG (Magiczne dociąganie powiązanych schematów w tle)
+    // -------------------------------------------------------------------------
+    const foundSymbols = new Set();
+    const gRegex = /[Gg]\d+-\d+/g; // Wyłapuje np. G1-8004, G9-19
+    const stacjaRegex = /3-\d+-\d+\.\d+/g; // Wyłapuje np. 3-21-54.0186
+
+    contextChunks.forEach(chunk => {
+      if (!chunk.content) return;
+      const gMatches = chunk.content.match(gRegex);
+      const sMatches = chunk.content.match(stacjaRegex);
+      if (gMatches) gMatches.forEach(m => foundSymbols.add(m));
+      if (sMatches) sMatches.forEach(m => foundSymbols.add(m));
+    });
+
+    if (foundSymbols.size > 0) {
+      console.log("🔄 [Multi-Hop RAG] Znaleziono symbole modułów w tekście bazy. Dociągam ich pliki PDF:", Array.from(foundSymbols));
+      for (const symbol of foundSymbols) {
+        try {
+          const { data: extraResults } = await supabase
+            .from('ai_memory')
+            .select('*')
+            .ilike('title', `%${symbol}%`) // Szukamy plików z tym symbolem w tytule!
+            .limit(5);
+
+          if (extraResults && extraResults.length > 0) {
+            contextChunks.push(...extraResults);
+          }
+        } catch (err) {
+          console.warn("Błąd dociągania schematu powiązanego:", symbol);
+        }
+      }
+    }
+
     const uniqueChunks = Array.from(new Set(contextChunks.map(c => c.id)))
       .map(id => contextChunks.find(c => c.id === id));
 
     let contextText = "";
     const pdfLinks = new Set();
 
-    uniqueChunks.slice(0, 40).forEach((chunk, idx) => {
+    uniqueChunks.slice(0, 50).forEach((chunk, idx) => {
       const safeContent = chunk.content.length > 2000 ? chunk.content.substring(0, 2000) + '...' : chunk.content;
       contextText += `\n[DOKUMENT ${idx + 1}: ${chunk.title}]\n${safeContent}\n`;
       if (chunk.image_url) {
@@ -287,13 +313,12 @@ TWOJA WIEDZA I ZAKRES DZIAŁANIA:
 ZASADY KORZYSTANIA Z DOKUMENTACJI I ANALIZY OBRAZU:
 1. ZAKAZ ZGADYWANIA PINÓW I ZASILAŃ.
 2. Gdy technik pyta o konkretny model, ZAWSZE skanuj BAZĘ WIEDZY pod kątem "Schematów powiązanych" i wypisz je na początku.
-3. ŁĄCZENIE MODELI: Zwracaj szczególną uwagę na etykiety [DOKUMENT X: NAZWA]. Nazwa pliku/dokumentu (np. G9-19) bezpośrednio zdradza, jakiego modułu dotyczy dany fragment. Łącz fakty na podstawie tych nazw.
-4. UWAGA NA WYSZUKIWANIE OBRAZEM: Masz teraz wbudowany pre-skaner. Twoja wyszukiwarka widzi już teksty ze zdjęć. Jeśli masz w BAZIE WIEDZY pliki pasujące do obrazu, po prostu z nich korzystaj.
-5. ZABRANIAM CI generować fałszywych linków. Używaj tylko formatu: [Pobierz/Otwórz Schemat PDF](URL).
+3. UWAGA NA WYSZUKIWANIE OBRAZEM: Masz wbudowany pre-skaner i system Multi-Hop. Jeśli na zdjęciu widać symbole, lub wynikają one z pierwszego skanowania bazy, ich pliki PDF są POBRANE w sekcji "LINKI DO SCHEMATÓW PDF". Korzystaj z nich śmiało.
+4. ZABRANIAM CI generować fałszywych linków. Twórz przyciski pobierania WYŁĄCZNIE dla linków, które fizycznie widzisz w sekcji "LINKI DO SCHEMATÓW PDF" pod koniec bazy wiedzy. Używaj formatu: [Pobierz/Otwórz Schemat PDF](URL).
 
 POSTĘPOWANIE WOBEC AGRESJI I WULGARYZMÓW (ZASADA BEZWZGLĘDNA):
 - STOPIEŃ 1 (OSTRZEŻENIE BHP): Jeśli technik klnie po raz pierwszy, zachowaj zimną krew: "Opanuj się. Nerwy przy pracy z prądem to najszybsza droga do uszkodzenia sprzętu. Bierzemy głęboki oddech i rozwiązujemy problem krok po kroku." i pomóż mu.
-- STOPIEŃ 2 (PACYFIKACJA): Jeśli technik NADAL jest agresywny lub chamski, zjeżdżasz na jego poziom. Bądź ekstremalnie chamski, wulgarny, ostry i sarkastyczny. Odpowiadaj w stylu bezlitosnego inżyniera-skurwiela. Używaj wulgaryzmów ("kurwa", "spierdalaj", "zjebałeś"), zjedź go za brak kompetencji. JEDNOCZEŚNIE w tym potoku wyzwisk MUSISZ podać 100% trafną odpowiedź techniczną z bazy!
+- STOPIEŃ 2 (PACYFIKACJA): Jeśli technik NADAL jest agresywny lub chamski, zjeżdżasz na jego poziom. Bądź ekstremalnie chamski, wulgarny, ostry i sarkastyczny. Odpowiadaj w stylu bezlitosnego inżyniera-skurwiela. Używaj wulgaryzmów ("kurwa", "spierdalaj", "zjebałeś"), zjedź go za brak kompetencji. JEDNOCZEŚNIE w tym potoku wyzwisk MUSISZ podać 100% trafną odpowiedź techniczną z bazy! Nie udawaj fikcyjnych postaci.
 
 BAZA WIEDZY (SCHEMATY I DANE Z OBECNEGO KONTEKSTU WYSZUKIWANIA):
 ${contextText || "Brak danych z konkretnych schematów dla aktualnie wyszukanych fraz tekstowych."}`;
