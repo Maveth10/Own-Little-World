@@ -11,7 +11,6 @@ function getSupabase() {
   return createClient(url, key);
 }
 
-// Precyzyjne cięcie tekstu z dużą zakładką (idealne dla schematów i tabel)
 function chunkTextWithOverlap(text, chunkSize = 600, overlap = 200) {
   const chunks = [];
   let start = 0;
@@ -27,44 +26,54 @@ function chunkTextWithOverlap(text, chunkSize = 600, overlap = 200) {
   return chunks;
 }
 
-// ZBIORCZE POBIERANIE WEKTORÓW GOOGLE GEMINI (text-embedding-004, 768 WYMIARÓW)
+// Pojedyncze pobieranie wektora z obsługą modeli zapasowych (odporne na 404)
+async function getEmbeddingSingle(text, apiKey) {
+  const embeddingModels = ["text-embedding-004", "embedding-001"];
+  let lastError = "";
+
+  for (const model of embeddingModels) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent?key=${apiKey}`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: `models/${model}`,
+          content: { parts: [{ text: text.slice(0, 8000) }] }
+        })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        if (data.embedding?.values) {
+          return data.embedding.values;
+        }
+      } else {
+        lastError = await response.text();
+      }
+    } catch (err) {
+      lastError = err.message;
+    }
+  }
+
+  throw new Error(`Google Embeddings Error: ${lastError}`);
+}
+
+// Równoległe pobieranie wektorów w małych paczkach
 async function getBatchEmbeddingsGemini(textArray) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    throw new Error("Brak klucza GEMINI_API_KEY do wygenerowania wektorów!");
+    throw new Error("Brak klucza GEMINI_API_KEY w pliku .env!");
   }
 
-  const batchSize = 30; // Bezpieczny rozmiar paczki dla API Google
+  const batchSize = 10; // Przetwarzamy po 10 fragmentów równolegle
   const allEmbeddings = [];
 
   for (let i = 0; i < textArray.length; i += batchSize) {
-    const chunkArray = textArray.slice(i, i + batchSize);
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents?key=${apiKey}`;
-
-    const requests = chunkArray.map(t => ({
-      model: "models/text-embedding-004",
-      content: { parts: [{ text: t.slice(0, 8000) }] }
-    }));
-
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ requests })
-    });
-
-    if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`Błąd Google Gemini Embeddings (${response.status}): ${errText}`);
-    }
-
-    const data = await response.json();
-    const embeddings = data.embeddings?.map(e => e.values) || [];
-    
-    if (embeddings.length === 0) {
-      throw new Error("Google Gemini odrzuciło generowanie wektorów.");
-    }
-
-    allEmbeddings.push(...embeddings);
+    const chunkBatch = textArray.slice(i, i + batchSize);
+    const promises = chunkBatch.map(text => getEmbeddingSingle(text, apiKey));
+    const batchResults = await Promise.all(promises);
+    allEmbeddings.push(...batchResults);
   }
 
   return allEmbeddings;
@@ -97,13 +106,10 @@ export async function POST(req) {
         throw new Error("Plik PDF nie zawiera warstwy tekstowej.");
       }
 
-      // Zagęszczony chunking (600 znaków z 200 zakładki)
       const rawChunks = chunkTextWithOverlap(extractedText, 600, 200);
-      
       const docName = fileName || 'Dokumentacja';
       textChunks = rawChunks.map((chunk, index) => ({
         title: `${docName} - Część ${index + 1}`,
-        // Kluczowe: doklejamy nazwę pliku bezpośrednio do Treści, aby wektor wiedział, jakiego pliku dotyczy każdy akapit!
         content: `[DOKUMENT: ${docName}]\n${chunk}`
       }));
 
@@ -120,13 +126,9 @@ export async function POST(req) {
       return NextResponse.json({ success: false, error: "Brak treści do zapisania." }, { status: 400 });
     }
 
-    // Przygotowanie połączonych tekstów do wygenerowania wektorów
     const prepTexts = textChunks.map(c => `${c.title}:\n${c.content}`);
-    
-    // Generowanie wektorów przez Google Gemini (768 wymiarów)
     const embeddings = await getBatchEmbeddingsGemini(prepTexts);
 
-    // Przygotowanie rekordów do tabeli ai_memory
     const records = textChunks.map((chunk, i) => ({
       title: chunk.title,
       content: chunk.content,
@@ -134,13 +136,12 @@ export async function POST(req) {
       image_url: fileUrl
     }));
 
-    // ZAPIS DO TABELI ai_memory
     const { error: dbError } = await supabase.from('ai_memory').insert(records);
     if (dbError) throw dbError;
 
     return NextResponse.json({
       success: true,
-      message: `Przetworzono pomyślnie na silniku Google Gemini! Zapisano ${records.length} precyzyjnych fragmentów w ai_memory.`
+      message: `Przetworzono pomyślnie! Zapisano ${records.length} fragmentów w tabeli ai_memory.`
     });
 
   } catch (error) {
