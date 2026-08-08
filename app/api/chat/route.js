@@ -49,11 +49,17 @@ async function getEmbedding(text) {
   return null;
 }
 
-// INTELIGENTNA integracja z Google Gemini - Dynamiczne pobieranie listy modeli z silnym filtrem
+// INTELIGENTNA ROTACJA MODELI GOOGLE GEMINI (Bypass limitów 429)
 async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
-  let targetModel = "gemini-1.5-flash"; // Bezpieczna wartość domyślna
+  // Lista awaryjna, gdyby pobieranie padło
+  let availableModels = [
+    "gemini-2.0-flash", 
+    "gemini-1.5-pro", 
+    "gemini-1.5-flash", 
+    "gemini-1.5-flash-8b"
+  ]; 
 
-  // KROK 1: Dynamiczne zapytanie do Google o dostępne modele i rygorystyczne filtrowanie
+  // KROK 1: Pobieramy listę wszystkich modeli z serwera
   try {
     const listUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
     const listRes = await fetch(listUrl, { method: "GET" });
@@ -62,35 +68,30 @@ async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
       const listData = await listRes.json();
       if (listData.models && listData.models.length > 0) {
         
-        // Wyciągamy modele flash, ale wyrzucamy TTS, Audio, Vision i Embeddingi
-        const flashModels = listData.models
+        // Filtrujemy tylko modele tekstowe Gemini (wyrzucamy tts, audio, vision, embeddingi)
+        const fetchedModels = listData.models
           .filter(m => 
             m.name.includes("gemini") && 
-            m.name.includes("flash") && 
             !m.name.includes("tts") && 
             !m.name.includes("audio") && 
             !m.name.includes("vision") && 
+            !m.name.includes("embedding") &&
             m.supportedGenerationMethods?.includes("generateContent")
           )
           .map(m => m.name.replace("models/", ""));
           
-        if (flashModels.length > 0) {
-          // Staramy się unikać wersji 'preview' oraz 'exp' na rzecz stabilnych wydań
-          const stableModels = flashModels.filter(m => !m.includes("preview") && !m.includes("exp"));
-          
-          targetModel = stableModels.length > 0 
-            ? stableModels[stableModels.length - 1] 
-            : flashModels[flashModels.length - 1];
-            
-          console.log("Dynamicznie wybrano STABILNY model Gemini:", targetModel);
+        if (fetchedModels.length > 0) {
+          // Odwracamy tablicę, żeby skrypt zawsze zaczynał próby od najnowszych modeli
+          availableModels = fetchedModels.reverse(); 
+          console.log("Załadowano magazyn modeli do rotacji:", availableModels.length, "szt.");
         }
       }
     }
   } catch(e) {
-    console.warn("Błąd podczas pobierania dynamicznej listy modeli Gemini. Używam modelu awaryjnego.");
+    console.warn("Błąd pobierania listy modeli. Przechodzę na rotację awaryjną.");
   }
 
-  // KROK 2: Przygotowanie formatu dla Google i wykonanie właściwego strzału
+  // KROK 2: Przygotowanie wiadomości
   const contents = messagesArray
     .filter(msg => msg.role !== 'system')
     .map(msg => ({
@@ -98,33 +99,50 @@ async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
       parts: [{ text: msg.content || msg.text || "..." }]
     }));
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${targetModel}:generateContent?key=${apiKey}`;
-  
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      systemInstruction: {
-        parts: [{ text: systemPrompt }]
-      },
-      contents: contents,
-      generationConfig: {
-        temperature: 0.1, 
-        maxOutputTokens: 2048
-      }
-    })
-  });
+  let lastError = "";
 
-  if (response.ok) {
-    const data = await response.json();
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (text) return text;
-  } else {
-    const errText = await response.text();
-    throw new Error(`${response.status} na modelu ${targetModel} - ${errText}`);
+  // KROK 3: Pętla rotacyjna (Strzelamy model po modelu, dopóki któryś nie odpowie)
+  for (const model of availableModels) {
+    try {
+      // Pomijamy znane eksperymentalne pułapki bez czatu
+      if(model.includes("exp") && !model.includes("flash") && !model.includes("pro")) continue;
+
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          systemInstruction: {
+            parts: [{ text: systemPrompt }]
+          },
+          contents: contents,
+          generationConfig: {
+            temperature: 0.1, 
+            maxOutputTokens: 2048
+          }
+        })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (text) {
+          console.log(`Sukces! Odpowiedział model: ${model}`);
+          return text; // ZWRACAMY WYNIK I PRZERYWAMY PĘTLĘ
+        }
+      } else {
+        const errText = await response.text();
+        lastError = `[${model}] - kod ${response.status}: ${errText}`;
+        console.warn(`Model ${model} zablokowany (np. limit 429). Ładuję kolejny...`);
+        // Pętla toczy się dalej i uderza w następny model!
+      }
+    } catch (err) {
+      lastError = `[${model}] wyjątek: ${err.message}`;
+    }
   }
 
-  throw new Error(`Żaden z modeli nie zwrócił poprawnej odpowiedzi. Testowany: ${targetModel}`);
+  throw new Error(`Wystrzelano wszystkie modele z magazynu i żaden nie odpowiedział. Ostatni błąd: ${lastError}`);
 }
 
 export async function POST(req) {
@@ -202,8 +220,8 @@ export async function POST(req) {
       contextText += `\nLINKI DO SCHEMATÓW PDF:\n` + Array.from(pdfLinks).map(url => `- ${url}`).join('\n') + `\n`;
     }
 
-// 4. RYGORYSTYCZNY PROMPT INŻYNIERSKI Z OSOBOWOŚCIĄ I WIEDZĄ
-const systemPrompt = `Jesteś Głównym Inżynierem Wsparcia Zdalnego w Axon AI. Pomagasz technikom w terenie.
+    // 4. RYGORYSTYCZNY PROMPT INŻYNIERSKI Z OSOBOWOŚCIĄ I WIEDZĄ
+    const systemPrompt = `Jesteś Głównym Inżynierem Wsparcia Zdalnego w Axon AI. Pomagasz technikom w terenie.
 
 TWOJA WIEDZA I ZAKRES DZIAŁANIA:
 1. Jesteś absolutnym ekspertem z zakresu: stacji ładowania EV, elektrotechniki, miernictwa, mechaniki pojazdowej (nie tylko EV, zasady działania każdego pojazdu), a także PROGRAMOWANIA (analiza plików konfiguracyjnych, zmiana parametrów, kody błędów).
@@ -225,23 +243,22 @@ ${contextText || "Brak danych z konkretnych schematów dla tego zapytania."}`;
     let replyText = "";
     let geminiErrorDetails = "";
 
-    // 5. OGRANICZENIE HISTORII
     const conversationHistory = messages.length > 0 
       ? messages.slice(-4) 
       : [{ role: 'user', content: lastUserMessage }];
 
-    // 6. WYWOŁANIE GOOGLE GEMINI
+    // 5. WYWOŁANIE GOOGLE GEMINI Z ROTACJĄ
     const geminiKey = process.env.GEMINI_API_KEY;
     if (geminiKey) {
       try {
         replyText = await callGeminiAPI(systemPrompt, conversationHistory, geminiKey);
       } catch (geminiErr) {
         geminiErrorDetails = geminiErr.message;
-        console.warn("Błąd silnika Gemini:", geminiErrorDetails);
+        console.warn("Błąd po wyczerpaniu wszystkich modeli Gemini:", geminiErrorDetails);
       }
     }
 
-    // 6. FALLBACK GROQ (TYLKO model 70B - ratunkowy)
+    // 6. FALLBACK GROQ (Model 70B)
     if (!replyText && process.env.GROQ_API_KEY) {
       try {
         const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
@@ -263,7 +280,7 @@ ${contextText || "Brak danych z konkretnych schematów dla tego zapytania."}`;
     }
 
     if (!replyText) {
-      replyText = `❌ Odpowiedź zablokowana.\nSzczegóły błędu Google Gemini:\n\`${geminiErrorDetails}\``;
+      replyText = `❌ Odpowiedź zablokowana. Wyczerpano limity (429) na WSZYSTKICH dostępnych modelach Gemini i Groq.\nSzczegóły:\n\`${geminiErrorDetails}\``;
     }
 
     return NextResponse.json({
