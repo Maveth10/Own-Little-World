@@ -49,37 +49,55 @@ async function getEmbedding(text) {
   return null;
 }
 
-// Obsługa zapytania do silnika Google Gemini (1 000 000 TPM limitu)
+// Obsługa zapytania do silników Google Gemini z kaskadą wersji
 async function callGeminiAPI(systemPrompt, userQuery) {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return null;
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: `${systemPrompt}\n\nPYTANIE UŻYTKOWNIKA:\n${userQuery}` }]
-        }
-      ],
-      generationConfig: {
-        temperature: 0.1,
-        maxOutputTokens: 2048
-      }
-    })
-  });
-
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Błąd Gemini API (${response.status}): ${errText}`);
+  if (!apiKey) {
+    console.warn("Brak zmiennej GEMINI_API_KEY w środowisku Vercel.");
+    return null;
   }
 
-  const data = await response.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || null;
+  const geminiModels = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash"
+  ];
+
+  for (const model of geminiModels) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: `${systemPrompt}\n\nPYTANIE UŻYTKOWNIKA:\n${userQuery}` }]
+            }
+          ],
+          generationConfig: {
+            temperature: 0.1,
+            maxOutputTokens: 2048
+          }
+        })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (text) return text;
+      } else {
+        const errBody = await response.text();
+        console.warn(`Gemini (${model}) błąd ${response.status}:`, errBody);
+      }
+    } catch (err) {
+      console.warn(`Błąd połączenia z Gemini (${model}):`, err.message);
+    }
+  }
+
+  return null;
 }
 
 export async function POST(req) {
@@ -116,7 +134,7 @@ export async function POST(req) {
       }
     }
 
-    // 2. WYSZUKIWANIE TEKSTOWE / PO SYMBOLACH
+    // 2. WYSZUKIWANIE TEKSTOWE
     if (contextChunks.length === 0) {
       const cleanTerms = lastUserMessage
         .replace(/[^a-zA-Z0-9.-]/g, ' ')
@@ -177,40 +195,44 @@ ${contextText || "Brak danych w bazie."}`;
 
     let replyText = "";
 
-    // 4. STRAŻNIK LIMITÓW: Najpierw próba wywołania Google Gemini (1M TPM)
+    // 4. WYWOŁANIE GEMINI (Główny silnik z limitem 1 000 000 TPM)
     try {
       replyText = await callGeminiAPI(systemPrompt, lastUserMessage);
     } catch (geminiErr) {
-      console.warn("Błąd silnika Gemini, przełączanie na Groq:", geminiErr.message);
+      console.warn("Błąd silnika Gemini:", geminiErr.message);
     }
 
-    // 5. FALLBACK: Jeśli Gemini nie zwróci wyniku, wywołujemy Groq (Llama 70B -> Llama 8B)
-    if (!replyText) {
-      const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-      const fallbackModels = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant'];
+    // 5. FALLBACK GROQ (W przypadku gdyby Gemini nie odpowiedziało)
+    if (!replyText && process.env.GROQ_API_KEY) {
+      try {
+        const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+        const fallbackModels = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant'];
 
-      const formattedMessages = [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: lastUserMessage }
-      ];
+        const formattedMessages = [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: lastUserMessage }
+        ];
 
-      for (const modelName of fallbackModels) {
-        try {
-          const chatCompletion = await groq.chat.completions.create({
-            messages: formattedMessages,
-            model: modelName,
-            temperature: 0.1,
-          });
-          replyText = chatCompletion.choices[0]?.message?.content || "";
-          if (replyText) break;
-        } catch (groqErr) {
-          console.warn(`Groq (${modelName}) limit:`, groqErr.message);
+        for (const modelName of fallbackModels) {
+          try {
+            const chatCompletion = await groq.chat.completions.create({
+              messages: formattedMessages,
+              model: modelName,
+              temperature: 0.1,
+            });
+            replyText = chatCompletion.choices[0]?.message?.content || "";
+            if (replyText) break;
+          } catch (groqErr) {
+            console.warn(`Groq (${modelName}) limit:`, groqErr.message);
+          }
         }
+      } catch (e) {
+        console.warn("Inicjalizacja Groq nie powiodła się:", e.message);
       }
     }
 
     if (!replyText) {
-      replyText = "Nie udało się pobrać odpowiedzi. Spróbuj ponownie za chwilę.";
+      replyText = "⚠️ Upewnij się, że dodałeś klucz GEMINI_API_KEY w ustawieniach Vercel i wykonałeś Redeploy. Dzienne limity darmowego Groqa zostały wyczerpane.";
     }
 
     return NextResponse.json({
