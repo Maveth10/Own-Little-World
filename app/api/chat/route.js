@@ -49,40 +49,74 @@ async function getEmbedding(text) {
   return null;
 }
 
-// Integracja z Google Gemini API (model 1.5-flash) z obsługą historii
+// INTELIGENTNA integracja z Google Gemini - Dynamiczne pobieranie listy modeli
 async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+  let targetModel = "gemini-1.5-flash"; // Wartość awaryjna
+  let lastError = "";
 
-  // Mapowanie ról z naszego czatu (user/assistant) na format Google (user/model)
+  // KROK 1: Pytamy Google o listę faktycznie dostępnych modeli dla tego klucza
+  try {
+    const listUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
+    const listRes = await fetch(listUrl, { method: "GET" });
+    
+    if (listRes.ok) {
+      const listData = await listRes.json();
+      if (listData.models && listData.models.length > 0) {
+        // Wyciągamy modele ze słowem "flash", które wspierają generowanie tekstu (generateContent)
+        const flashModels = listData.models
+          .filter(m => m.name.includes("flash") && m.supportedGenerationMethods?.includes("generateContent"))
+          .map(m => m.name.replace("models/", ""));
+          
+        if (flashModels.length > 0) {
+          // Bierzemy najnowszy działający model z listy (np. gemini-3.5-flash)
+          targetModel = flashModels[flashModels.length - 1]; 
+          console.log("Wykryto dostępne modele Google. Wybrano:", targetModel);
+        }
+      }
+    }
+  } catch(e) {
+    console.warn("Nie udało się pobrać listy modeli Gemini. Próba z wersją domyślną.");
+  }
+
+  // KROK 2: Wywołanie API na 100% istniejącym modelu
   const contents = messagesArray
-    .filter(msg => msg.role !== 'system') // System prompt przesyłamy oddzielnie
+    .filter(msg => msg.role !== 'system')
     .map(msg => ({
       role: msg.role === 'assistant' || msg.role === 'ai' ? 'model' : 'user',
       parts: [{ text: msg.content || msg.text || "..." }]
     }));
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      systemInstruction: {
-        parts: [{ text: systemPrompt }]
-      },
-      contents: contents,
-      generationConfig: {
-        temperature: 0.1,
-        maxOutputTokens: 2048
-      }
-    })
-  });
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${targetModel}:generateContent?key=${apiKey}`;
+    
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: {
+          parts: [{ text: systemPrompt }]
+        },
+        contents: contents,
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: 2048
+        }
+      })
+    });
 
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`${response.status} - ${errText}`);
+    if (response.ok) {
+      const data = await response.json();
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (text) return text;
+    } else {
+      const errText = await response.text();
+      lastError = `${response.status} - ${errText}`;
+    }
+  } catch (err) {
+    lastError = err.message;
   }
 
-  const data = await response.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || null;
+  throw new Error(`Google API odrzuciło zapytanie dla modelu ${targetModel}. Błąd: ${lastError}`);
 }
 
 export async function POST(req) {
@@ -108,7 +142,7 @@ export async function POST(req) {
         const { data: vectorData } = await supabase.rpc('match_ai_memory', {
           query_embedding: queryEmbedding,
           match_threshold: 0.01,
-          match_count: 6
+          match_count: 5
         });
 
         if (vectorData && vectorData.length > 0) {
@@ -132,7 +166,7 @@ export async function POST(req) {
             .from('ai_memory')
             .select('*')
             .or(`title.ilike.%${term}%,content.ilike.%${term}%`)
-            .limit(6);
+            .limit(4);
 
           if (searchResults && searchResults.length > 0) {
             contextChunks.push(...searchResults);
@@ -147,7 +181,7 @@ export async function POST(req) {
           .from('ai_memory')
           .select('*')
           .order('id', { ascending: false })
-          .limit(6);
+          .limit(3);
 
         if (recentData) contextChunks = recentData;
       }
@@ -160,8 +194,9 @@ export async function POST(req) {
     let contextText = "";
     const pdfLinks = new Set();
 
-    uniqueChunks.forEach((chunk, idx) => {
-      contextText += `\n[DOKUMENT ${idx + 1}: ${chunk.title}]\n${chunk.content}\n`;
+    uniqueChunks.slice(0, 5).forEach((chunk, idx) => {
+      const safeContent = chunk.content.length > 1200 ? chunk.content.substring(0, 1200) + '...' : chunk.content;
+      contextText += `\n[DOKUMENT ${idx + 1}: ${chunk.title}]\n${safeContent}\n`;
       if (chunk.image_url) {
         pdfLinks.add(chunk.image_url);
       }
@@ -181,9 +216,8 @@ ${contextText || "Brak danych w bazie."}`;
     let replyText = "";
     let geminiErrorDetails = "";
 
-    // Przygotowanie jednolitej historii rozmowy dla API
     const conversationHistory = messages.length > 0 
-      ? messages 
+      ? messages.slice(-4) 
       : [{ role: 'user', content: lastUserMessage }];
 
     // 4. WYWOŁANIE GOOGLE GEMINI
@@ -193,13 +227,11 @@ ${contextText || "Brak danych w bazie."}`;
         replyText = await callGeminiAPI(systemPrompt, conversationHistory, geminiKey);
       } catch (geminiErr) {
         geminiErrorDetails = geminiErr.message;
-        console.warn("Błąd silnika Gemini:", geminiErrorDetails);
+        console.warn("Błąd silników Gemini:", geminiErrorDetails);
       }
-    } else {
-      geminiErrorDetails = "Brak klucza GEMINI_API_KEY w środowisku.";
     }
 
-    // 5. FALLBACK GROQ (uruchomi się, jeśli Gemini rzuci błędem)
+    // 5. FALLBACK GROQ (uruchomi się, jeśli Gemini odrzuci połączenie)
     if (!replyText && process.env.GROQ_API_KEY) {
       try {
         const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
@@ -220,7 +252,7 @@ ${contextText || "Brak danych w bazie."}`;
             replyText = chatCompletion.choices[0]?.message?.content || "";
             if (replyText) break;
           } catch (groqErr) {
-            console.warn(`Groq (${modelName}) limit:`, groqErr.message);
+            console.warn(`Groq (${modelName}) limit lub błąd:`, groqErr.message);
           }
         }
       } catch (e) {
@@ -228,9 +260,8 @@ ${contextText || "Brak danych w bazie."}`;
       }
     }
 
-    // Wyświetlanie jawnego błędu, jeśli wszystkie metody zawiodą
     if (!replyText) {
-      replyText = `❌ Odpowiedź zablokowana.\nSzczegóły błędu Google Gemini:\n\`${geminiErrorDetails}\``;
+      replyText = `❌ Odpowiedź zablokowana. Wykorzystano darmowe pule tokenów.\n\nSzczegóły Gemini:\n\`${geminiErrorDetails}\``;
     }
 
     return NextResponse.json({
