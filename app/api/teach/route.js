@@ -12,38 +12,44 @@ function getSupabase() {
   return createClient(url, key);
 }
 
-// Precyzyjna funkcja wektoryzacji pokazująca dokładne błędy Hugging Face
+// Odporna funkcja wektoryzacji wykonująca zapytania w sposób sekwencyjny
 async function getEmbedding(text) {
   const apiKey = process.env.HF_API_KEY;
-  if (!apiKey) throw new Error("Brak klucza HF_API_KEY w Vercelu. Sprawdź Environment Variables!");
+  if (!apiKey) throw new Error("Brak klucza HF_API_KEY w zmiennych środowiskowych.");
 
-  const url = "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2";
+  const endpoints = [
+    "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2",
+    "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
+  ];
 
-  try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { 
-        "Authorization": `Bearer ${apiKey}`, 
-        "Content-Type": "application/json",
-        "x-wait-for-model": "true" 
-      },
-      body: JSON.stringify({ inputs: text, options: { wait_for_model: true } }),
-      cache: "no-store"
-    });
+  for (const url of endpoints) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { 
+            "Authorization": `Bearer ${apiKey}`, 
+            "Content-Type": "application/json",
+            "User-Agent": "AxonAI-App/1.0",
+            "x-wait-for-model": "true" 
+          },
+          body: JSON.stringify({ inputs: text, options: { wait_for_model: true } }),
+          cache: "no-store"
+        });
 
-    if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`HTTP ${response.status}: ${errText}`);
+        if (response.ok) {
+          const result = await response.json();
+          if (Array.isArray(result) && Array.isArray(result[0])) return result[0];
+          if (Array.isArray(result) && typeof result[0] === 'number') return result;
+        }
+      } catch (err) {
+        console.warn(`Nieudana próba wektoryzacji (${url}):`, err.message);
+      }
+      await new Promise((res) => setTimeout(res, 300));
     }
-
-    const result = await response.json();
-    if (Array.isArray(result) && Array.isArray(result[0])) return result[0];
-    if (Array.isArray(result) && typeof result[0] === 'number') return result;
-
-    throw new Error(`Błędny format wektora z HF: ${JSON.stringify(result).slice(0, 100)}`);
-  } catch (err) {
-    throw new Error(`Błąd wektoryzacji HF: ${err.message}`);
   }
+
+  return null;
 }
 
 export async function POST(req) {
@@ -73,7 +79,7 @@ Podziel skomplikowane tabele na czytelne fragmenty dla inżyniera.`;
     const isPdf = fileUrl && (fileType === 'application/pdf' || fileName.endsWith('.pdf'));
     const isImage = fileUrl && fileType.startsWith('image/');
 
-    // OBSŁUGA PDF (Pobranie z Supabase Storage i parsowanie tekstu)
+    // OBSŁUGA PDF (Pobranie z Supabase Storage i bezpieczne dzielenie na porcje)
     if (isPdf) {
       const pdfRes = await fetch(fileUrl);
       if (!pdfRes.ok) throw new Error("Nie udało się pobrać pliku PDF z magazynu Supabase.");
@@ -83,22 +89,46 @@ Podziel skomplikowane tabele na czytelne fragmenty dla inżyniera.`;
       const pdfData = await pdfParse(buffer);
       const extractedPdfText = pdfData.text || "";
 
-      const groqPrompt = `Przeanalizuj poniższą dokumentację techniczną z pliku PDF i ustrukturyzuj ją dla serwisanta.\nNotatka użytkownika: "${userInput}"\n\nTREŚĆ DOKUMENTACJI PDF:\n${extractedPdfText.slice(0, 30000)}`;
+      // Dzielimy tekst na porcje po 9000 znaków (~2200 tokenów), aby mieszczeć się w limicie 12k TPM Groq
+      const chunkSize = 9000;
+      const textParts = [];
+      for (let i = 0; i < extractedPdfText.length; i += chunkSize) {
+        textParts.push(extractedPdfText.slice(i, i + chunkSize));
+      }
 
-      const chatCompletion = await groq.chat.completions.create({
-        messages: [
-          { role: 'system', content: systemPromptJSON },
-          { role: 'user', content: groqPrompt }
-        ],
-        model: 'llama-3.3-70b-versatile',
-        temperature: 0.1,
-      });
+      // Bierzemy maksymalnie 4 najważniejsze porcje tekstu
+      const partsToProcess = textParts.slice(0, 4);
 
-      const responseText = chatCompletion.choices[0]?.message?.content || "[]";
-      try {
-        chunks = JSON.parse(responseText.replace(/```json/g, '').replace(/```/g, '').trim());
-      } catch {
-        chunks = [{ title: fileName || "Dokumentacja PDF", content: extractedPdfText.slice(0, 4000) }];
+      for (let idx = 0; idx < partsToProcess.length; idx++) {
+        const partText = partsToProcess[idx];
+        const groqPrompt = `Przeanalizuj fragment (${idx + 1}/${partsToProcess.length}) dokumentacji PDF i ustrukturyzuj go w JSON.\nNotatki: "${userInput}"\n\nTREŚĆ:\n${partText}`;
+
+        try {
+          const chatCompletion = await groq.chat.completions.create({
+            messages: [
+              { role: 'system', content: systemPromptJSON },
+              { role: 'user', content: groqPrompt }
+            ],
+            model: 'llama-3.3-70b-versatile',
+            temperature: 0.1,
+          });
+
+          const responseText = chatCompletion.choices[0]?.message?.content || "[]";
+          const parsed = JSON.parse(responseText.replace(/```json/g, '').replace(/```/g, '').trim());
+          if (Array.isArray(parsed)) chunks.push(...parsed);
+          else chunks.push(parsed);
+        } catch (groqErr) {
+          console.warn(`Groq rate limit dla części ${idx + 1}, stosowanie bezpiecznego zapisu:`, groqErr.message);
+          chunks.push({
+            title: `${fileName || "Dokumentacja PDF"} (Sekcja ${idx + 1})`,
+            content: partText.slice(0, 3000)
+          });
+        }
+
+        // 1.5 sekundy przerwy między zapytaniami, aby wyzerować zegar tokenów Groqa
+        if (idx < partsToProcess.length - 1) {
+          await new Promise((res) => setTimeout(res, 1500));
+        }
       }
 
     // OBSŁUGA ZDJĘĆ
@@ -181,24 +211,28 @@ Podziel skomplikowane tabele na czytelne fragmenty dla inżyniera.`;
       if (!chunk.title || !chunk.content) continue;
       
       const embedding = await getEmbedding(`${chunk.title}: ${chunk.content}`);
-      records.push({
-        title: chunk.title,
-        content: chunk.content,
-        embedding,
-        image_url: fileUrl
-      });
+      if (embedding) {
+        records.push({
+          title: chunk.title,
+          content: chunk.content,
+          embedding,
+          image_url: fileUrl
+        });
+      }
       
-      await new Promise((res) => setTimeout(res, 200));
+      await new Promise((resolve) => setTimeout(resolve, 250));
     }
 
     if (records.length > 0) {
       const { error: dbError } = await supabase.from('memories').insert(records);
       if (dbError) throw dbError;
+    } else if (chunks.length > 0) {
+      throw new Error("Nie udało się wygenerować wektorów w Hugging Face. Spróbuj ponownie.");
     }
 
     return NextResponse.json({
       success: true,
-      message: `Przeanalizowano plik i dodano ${records.length} wpisów do bazy wiedzy!`
+      message: `Przeanalizowano dokument i zapisano ${records.length} fragmentów w bazie wiedzy!`
     });
 
   } catch (error) {
