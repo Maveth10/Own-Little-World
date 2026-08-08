@@ -1,132 +1,159 @@
-'use client';
+import { Groq } from 'groq-sdk';
+import { createClient } from '@supabase/supabase-js';
+import { NextResponse } from 'next/server';
 
-import { useState } from 'react';
-import { Upload } from 'lucide-react';
-import imageCompression from 'browser-image-compression'; // Importujemy nasz kompresor!
+// Wymusza na serwerze Vercel czekanie aż do 60 sekund!
+export const maxDuration = 60; 
 
-export default function TeachAI() {
-  const [title, setTitle] = useState('');
-  const [content, setContent] = useState('');
-  const [file, setFile] = useState(null);
-  const [status, setStatus] = useState('');
+function getSupabase() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  if (!url || !key) throw new Error("Brak kluczy Supabase w pliku .env");
+  return createClient(url, key);
+}
 
-  const handleSave = async () => {
-    if (!title && !content && !file) {
-      setStatus('❌ Musisz dodać chociaż notatkę, tytuł lub plik!');
-      return;
+async function getEmbedding(text) {
+  const apiKey = process.env.HF_API_KEY;
+  if (!apiKey) throw new Error("Brak klucza HF_API_KEY");
+
+  const response = await fetch(
+    "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2",
+    {
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", "x-wait-for-model": "true" },
+      method: "POST",
+      body: JSON.stringify({ inputs: text, options: { wait_for_model: true } }),
+    }
+  );
+
+  if (!response.ok) throw new Error(`Błąd HF API: ${response.statusText}`);
+  const result = await response.json();
+  if (Array.isArray(result) && Array.isArray(result[0])) return result[0];
+  if (Array.isArray(result)) return result;
+  throw new Error("Nieprawidłowy format wektora");
+}
+
+// GŁÓWNA FUNKCJA POST - Odbiera pliki od przeglądarki
+export async function POST(req) {
+  try {
+    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    const supabase = getSupabase();
+
+    const formData = await req.formData();
+    const userInput = formData.get('content') || formData.get('prompt') || formData.get('title') || '';
+    const uploadedFile = formData.get('file');
+    const hasFile = uploadedFile && typeof uploadedFile === 'object' && uploadedFile.size > 0;
+
+    if (!userInput && !hasFile) {
+      return NextResponse.json({ success: false, error: "Brak materiału do analizy." }, { status: 400 });
     }
 
-    setStatus('⏳ Przetwarzanie: Kompresja pliku, analiza AI i zapis do bazy...');
+    const systemPromptJSON = `Jesteś inżynierem serwisu i ekspertem ds. dokumentacji. Przeanalizuj podane informacje (notatki użytkownika i surowe opisy ze schematów).
+Zwróć odpowiedź WYŁĄCZNIE jako tablicę obiektów JSON (bez formatowania markdown, sam kod):
+[
+  {
+    "title": "Krótki tytuł (np. Model X - Moduł Y)",
+    "content": "Szczegółowa wiedza techniczna wyciągnięta z opisu + słowa kluczowe"
+  }
+]
+Podziel długie teksty na logiczne fragmenty.`;
 
-    try {
-      const formData = new FormData();
-      if (title) formData.append('title', title);
-      if (content) formData.append('content', content);
-      
-      if (file) {
-        // KOMPRESJA ZDJĘĆ PRZED WYSYŁKĄ (Ominięcie limitu 4.5 MB na Vercel)
-        if (file.type.startsWith('image/')) {
-          const options = {
-            maxSizeMB: 0.5, // Maksymalnie 500 KB (idealne dla Vercela)
-            maxWidthOrHeight: 1920,
-            useWebWorker: true,
-          };
-          try {
-            const compressedFile = await imageCompression(file, options);
-            formData.append('file', compressedFile);
-            console.log(`Skompresowano z ${file.size / 1024 / 1024}MB do ${compressedFile.size / 1024 / 1024}MB`);
-          } catch (compressError) {
-            console.error('Błąd kompresji, wysyłam oryginał:', compressError);
-            formData.append('file', file); // W razie błędu kompresji ślemy oryginał
-          }
-        } else {
-          // Jeśli to PDF, wysyłamy bez kompresji (ale Vercel wciąż ma limit 4.5 MB!)
-          if (file.size > 4.5 * 1024 * 1024) {
-            setStatus('❌ Błąd: Twój plik PDF przekracza darmowy limit 4.5 MB na Vercel.');
-            return;
-          }
-          formData.append('file', file);
-        }
-      }
+    let chunks = [];
+    let responseText = "";
 
-      const res = await fetch('/api/teach', {
-        method: 'POST',
-        body: formData,
+    if (hasFile) {
+      const buffer = Buffer.from(await uploadedFile.arrayBuffer());
+      const base64Image = buffer.toString("base64");
+      const mimeType = uploadedFile.type || "image/jpeg";
+      const orApiKey = process.env.OPENROUTER_API_KEY;
+
+      const visionPrompt = "Przeanalizuj ten obraz/dokument ze szczegółami. Wypisz każdy tekst, oznaczenie komponentów, tabele, schematy połączeń i złącza. Opisz to bardzo technicznie, niczego nie pomijaj. Nie używaj formatu JSON, daj zwykły tekst.";
+
+      const orResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${orApiKey}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": "https://own-little-world.vercel.app",
+          "X-Title": "Axon AI Serwis"
+        },
+        body: JSON.stringify({
+          model: "nvidia/nemotron-nano-12b2vl:free",
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: visionPrompt },
+                { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Image}` } }
+              ]
+            }
+          ]
+        })
       });
 
-      const data = await res.json();
-
-      if (data.success) {
-        setStatus(`✅ Sukces! AI przeanalizowało materiał i dodało wpisy do bazy.`);
-        setTitle('');
-        setContent('');
-        setFile(null);
-      } else {
-        setStatus('❌ Błąd API: ' + data.error);
+      let visionDescription = "Brak opisu obrazu od modelu wizyjnego.";
+      if (orResponse.ok) {
+        const orData = await orResponse.json();
+        visionDescription = orData.choices[0]?.message?.content || visionDescription;
       }
-    } catch (error) {
-      setStatus('❌ Błąd połączenia z serwerem. Limit czasu lub awaria sieci.');
+
+      const groqPrompt = `Użytkownik dodał notatki: "${userInput}"\n\nOpis wgranego pliku (wygenerowany przez analizator wizyjny):\n"${visionDescription}"\n\nPołącz tę wiedzę i przygotuj tablicę JSON do bazy danych według instrukcji.`;
+
+      const chatCompletion = await groq.chat.completions.create({
+        messages: [
+          { role: 'system', content: systemPromptJSON },
+          { role: 'user', content: groqPrompt }
+        ],
+        model: 'llama-3.3-70b-versatile',
+        temperature: 0.1, 
+      });
+      responseText = chatCompletion.choices[0]?.message?.content || "[]";
+
+    } else {
+      const chatCompletion = await groq.chat.completions.create({
+        messages: [{ role: 'system', content: systemPromptJSON }, { role: 'user', content: userInput }],
+        model: 'llama-3.3-70b-versatile',
+        temperature: 0.1,
+      });
+      responseText = chatCompletion.choices[0]?.message?.content || "[]";
     }
-  };
 
-  return (
-    <div className="p-8 max-w-2xl mx-auto font-sans">
-      <h1 className="text-3xl font-bold mb-2">Panel Głównego Inżyniera</h1>
-      <p className="text-gray-600 mb-8">
-        Wgraj zdjęcie, PDF z instrukcją lub wklej notatki. AI wyciągnie szczegóły, wygeneruje tytuł i powiąże dane.
-      </p>
+    try {
+      chunks = JSON.parse(responseText.replace(/```json/g, '').replace(/```/g, '').trim());
+    } catch {
+      chunks = [{ title: "Wpis serwisowy", content: responseText }];
+    }
 
-      <div className="flex flex-col gap-5">
-        <input
-          type="text"
-          placeholder="Tytuł (opcjonalnie — jeśli zostawisz puste, AI nada tytuł sama)"
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-          className="p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-yellow-400 outline-none transition-all"
-        />
+    if (!Array.isArray(chunks)) chunks = [chunks];
 
-        <textarea
-          placeholder="Notatki / uwagi serwisowe (opcjonalnie)..."
-          value={content}
-          onChange={(e) => setContent(e.target.value)}
-          className="p-3 border border-gray-300 rounded-lg h-40 focus:ring-2 focus:ring-yellow-400 outline-none transition-all"
-        />
+    let fileUrl = null;
+    if (hasFile) {
+      const safeName = uploadedFile.name.replace(/[^a-zA-Z0-9.-]/g, '');
+      const fileName = `${Date.now()}_${safeName}`;
+      const buffer = Buffer.from(await uploadedFile.arrayBuffer());
+      const { data: uploadData, error: uploadError } = await supabase.storage.from('schematy').upload(fileName, buffer, { contentType: uploadedFile.type, upsert: true });
+      if (!uploadError && uploadData) {
+        fileUrl = supabase.storage.from('schematy').getPublicUrl(fileName).data.publicUrl;
+      }
+    }
 
-        <div className="border-2 border-dashed border-gray-300 rounded-xl p-8 flex flex-col items-center justify-center bg-gray-50 hover:bg-gray-100 transition-colors">
-          <Upload className="text-gray-400 mb-3" size={36} />
-          <label className="cursor-pointer text-yellow-600 font-bold hover:underline text-lg">
-            Wybierz plik (Zdjęcie lub mały PDF do 4MB)
-            <input
-              type="file"
-              accept="image/*,application/pdf"
-              className="hidden"
-              onChange={(e) => setFile(e.target.files[0])}
-            />
-          </label>
-          <p className="text-sm text-gray-500 mt-2">
-            Zbyt duże zdjęcia zostaną automatycznie pomniejszone.
-          </p>
-          {file && (
-            <p className="text-md text-green-600 font-bold mt-4 break-all text-center">
-              Wybrano plik: {file.name} ({(file.size / 1024 / 1024).toFixed(2)} MB)
-            </p>
-          )}
-        </div>
+    const records = [];
+    for (const chunk of chunks) {
+      if (!chunk.title || !chunk.content) continue;
+      const embedding = await getEmbedding(`${chunk.title}: ${chunk.content}`);
+      if (embedding) {
+        records.push({ title: chunk.title, content: chunk.content, embedding, image_url: fileUrl });
+      }
+    }
 
-        <button
-          onClick={handleSave}
-          disabled={!title && !content && !file}
-          className="p-4 bg-black text-white font-bold text-lg rounded-xl hover:bg-gray-800 transition-colors shadow-lg disabled:bg-gray-400"
-        >
-          Przeanalizuj i Zapisz w Pamięci AI
-        </button>
+    if (records.length > 0) {
+      const { error: dbError } = await supabase.from('memories').insert(records);
+      if (dbError) throw dbError;
+    }
 
-        {status && (
-          <div className={`mt-4 font-bold text-center text-lg p-4 rounded-lg shadow-sm border ${status.includes('❌') ? 'bg-red-50 text-red-800 border-red-200' : 'bg-white text-gray-800 border-gray-100'}`}>
-            {status}
-          </div>
-        )}
-      </div>
-    </div>
-  );
+    return NextResponse.json({ success: true, message: `Zakończono! Dodano ${records.length} wpisów do bazy!` });
+
+  } catch (error) {
+    console.error("Błąd w trakcie nauki:", error);
+    return NextResponse.json({ success: false, error: error.message }, { status: 500 });
+  }
 }
