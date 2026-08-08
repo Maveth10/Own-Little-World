@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { Upload, Folder, FileText, RefreshCw, X, CheckCircle } from 'lucide-react';
+import { Upload, Folder, FileText, RefreshCw, X, CheckCircle, Trash2 } from 'lucide-react';
 import { createClient } from '@supabase/supabase-js';
 
 function getSupabase() {
@@ -19,6 +19,32 @@ export default function TeachAI() {
   const [isDragging, setIsDragging] = useState(false);
   const [status, setStatus] = useState('');
   const [stats, setStats] = useState({ current: 0, total: 0, success: 0, skipped: 0, failed: 0 });
+
+  // FUNKCJA: TWARDY RESET BAZY I PLIKÓW
+  const handleHardReset = async () => {
+    if (!window.confirm("🚨 UWAGA: To bezpowrotnie usunie WSZYSTKIE schematy z bazy wektorowej oraz fizyczne pliki PDF z Supabase. Jesteś pewien?")) return;
+
+    setIsProcessing(true);
+    setStatus('🗑️ Czyszczenie bazy wektorowej i usuwanie plików...');
+    
+    try {
+      const res = await fetch('/api/reset', { method: 'POST' });
+      const data = await res.json();
+      
+      if (res.ok && data.success) {
+        setStatus(`✅ Sukces! ${data.message}`);
+        setFiles([]);
+        setTitle('');
+        setContent('');
+      } else {
+        setStatus(`❌ Błąd: ${data.error}`);
+      }
+    } catch (err) {
+      setStatus("❌ Błąd komunikacji z serwerem podczas czyszczenia.");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
 
   // Rekursywne skanowanie folderów i plików w Drag & Drop
   const scanEntry = async (entry) => {
@@ -219,7 +245,21 @@ export default function TeachAI() {
 
   return (
     <div className="p-8 max-w-3xl mx-auto font-sans">
-      <h1 className="text-3xl font-bold mb-2">Panel Głównego Inżyniera</h1>
+      <div className="flex justify-between items-start mb-2">
+        <h1 className="text-3xl font-bold">Panel Głównego Inżyniera</h1>
+        
+        {/* PRZYCISK CZYSZCZENIA BAZY */}
+        <button
+          onClick={handleHardReset}
+          disabled={isProcessing}
+          className="flex items-center gap-2 bg-red-50 text-red-600 hover:bg-red-600 hover:text-white border border-red-200 font-bold py-2 px-4 rounded-lg transition-colors shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
+          title="Usuwa wszystkie rekordy i pliki z Supabase"
+        >
+          <Trash2 size={18} />
+          Wyczyść całą bazę i pliki
+        </button>
+      </div>
+      
       <p className="text-gray-600 mb-8">
         Upuść plik, grupę plików lub cały folder. AI przeanalizuje dokumentację i powiąże dane.
       </p>
@@ -346,7 +386,7 @@ export default function TeachAI() {
             className={`mt-2 font-bold text-center text-base p-4 rounded-lg border ${
               status.includes('❌')
                 ? 'bg-red-50 text-red-800 border-red-200'
-                : status.includes('🎉')
+                : status.includes('🎉') || status.includes('✅')
                 ? 'bg-green-50 text-green-800 border-green-200'
                 : 'bg-white text-gray-800 border-gray-200 shadow-sm'
             }`}

@@ -11,7 +11,6 @@ function getSupabase() {
   return createClient(url, key);
 }
 
-// Pobieranie wektora zapytania
 async function getEmbedding(text) {
   const apiKey = process.env.HF_API_KEY;
   if (!apiKey) return null;
@@ -49,9 +48,8 @@ async function getEmbedding(text) {
   return null;
 }
 
-// INTELIGENTNA ROTACJA MODELI GOOGLE GEMINI (Bypass limitów 429)
+// INTELIGENTNA ROTACJA MODELI GOOGLE GEMINI
 async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
-  // Lista awaryjna, gdyby pobieranie padło
   let availableModels = [
     "gemini-2.0-flash", 
     "gemini-1.5-pro", 
@@ -59,7 +57,6 @@ async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
     "gemini-1.5-flash-8b"
   ]; 
 
-  // KROK 1: Pobieramy listę wszystkich modeli z serwera
   try {
     const listUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
     const listRes = await fetch(listUrl, { method: "GET" });
@@ -67,8 +64,6 @@ async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
     if (listRes.ok) {
       const listData = await listRes.json();
       if (listData.models && listData.models.length > 0) {
-        
-        // Filtrujemy tylko modele tekstowe Gemini (wyrzucamy tts, audio, vision, embeddingi)
         const fetchedModels = listData.models
           .filter(m => 
             m.name.includes("gemini") && 
@@ -81,9 +76,7 @@ async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
           .map(m => m.name.replace("models/", ""));
           
         if (fetchedModels.length > 0) {
-          // Odwracamy tablicę, żeby skrypt zawsze zaczynał próby od najnowszych modeli
           availableModels = fetchedModels.reverse(); 
-          console.log("Załadowano magazyn modeli do rotacji:", availableModels.length, "szt.");
         }
       }
     }
@@ -91,7 +84,6 @@ async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
     console.warn("Błąd pobierania listy modeli. Przechodzę na rotację awaryjną.");
   }
 
-  // KROK 2: Przygotowanie wiadomości
   const contents = messagesArray
     .filter(msg => msg.role !== 'system')
     .map(msg => ({
@@ -101,10 +93,8 @@ async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
 
   let lastError = "";
 
-  // KROK 3: Pętla rotacyjna (Strzelamy model po modelu, dopóki któryś nie odpowie)
   for (const model of availableModels) {
     try {
-      // Pomijamy znane eksperymentalne pułapki bez czatu
       if(model.includes("exp") && !model.includes("flash") && !model.includes("pro")) continue;
 
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
@@ -119,7 +109,7 @@ async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
           contents: contents,
           generationConfig: {
             temperature: 0.1, 
-            maxOutputTokens: 2048
+            maxOutputTokens: 8192 // ROZWIĄZANIE UCINANIA: Potężny limit długości odpowiedzi!
           }
         })
       });
@@ -127,22 +117,18 @@ async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
       if (response.ok) {
         const data = await response.json();
         const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (text) {
-          console.log(`Sukces! Odpowiedział model: ${model}`);
-          return text; // ZWRACAMY WYNIK I PRZERYWAMY PĘTLĘ
-        }
+        if (text) return text;
       } else {
         const errText = await response.text();
         lastError = `[${model}] - kod ${response.status}: ${errText}`;
-        console.warn(`Model ${model} zablokowany (np. limit 429). Ładuję kolejny...`);
-        // Pętla toczy się dalej i uderza w następny model!
+        console.warn(`Model ${model} zablokowany. Ładuję kolejny...`);
       }
     } catch (err) {
       lastError = `[${model}] wyjątek: ${err.message}`;
     }
   }
 
-  throw new Error(`Wystrzelano wszystkie modele z magazynu i żaden nie odpowiedział. Ostatni błąd: ${lastError}`);
+  throw new Error(`Wystrzelano wszystkie modele. Ostatni błąd: ${lastError}`);
 }
 
 export async function POST(req) {
@@ -160,7 +146,7 @@ export async function POST(req) {
 
     let contextChunks = [];
 
-    // 1. SZEROKIE WYSZUKIWANIE WEKTOROWE
+    // 1. OGROMNE WYSZUKIWANIE WEKTOROWE (Pole widzenia rozszerzone z 8 na 20!)
     const queryEmbedding = await getEmbedding(lastUserMessage);
 
     if (queryEmbedding) {
@@ -168,7 +154,7 @@ export async function POST(req) {
         const { data: vectorData } = await supabase.rpc('match_ai_memory', {
           query_embedding: queryEmbedding,
           match_threshold: 0.01,
-          match_count: 8
+          match_count: 20
         });
 
         if (vectorData && vectorData.length > 0) {
@@ -179,7 +165,7 @@ export async function POST(req) {
       }
     }
 
-    // 2. SZEROKIE WYSZUKIWANIE TEKSTOWE
+    // 2. OGROMNE WYSZUKIWANIE TEKSTOWE
     const cleanTerms = lastUserMessage
       .replace(/[^a-zA-Z0-9.-]/g, ' ')
       .split(' ')
@@ -191,7 +177,7 @@ export async function POST(req) {
           .from('ai_memory')
           .select('*')
           .or(`title.ilike.%${term}%,content.ilike.%${term}%`)
-          .limit(8);
+          .limit(20);
 
         if (searchResults && searchResults.length > 0) {
           contextChunks.push(...searchResults);
@@ -204,12 +190,12 @@ export async function POST(req) {
     const uniqueChunks = Array.from(new Set(contextChunks.map(c => c.id)))
       .map(id => contextChunks.find(c => c.id === id));
 
-    // 3. PRZYGOTOWANIE BAZY WIEDZY
+    // 3. PRZYGOTOWANIE POTĘŻNEJ BAZY WIEDZY (Do 40 fragmentów - zero martwych punktów!)
     let contextText = "";
     const pdfLinks = new Set();
 
-    uniqueChunks.slice(0, 12).forEach((chunk, idx) => {
-      const safeContent = chunk.content.length > 1500 ? chunk.content.substring(0, 1500) + '...' : chunk.content;
+    uniqueChunks.slice(0, 40).forEach((chunk, idx) => {
+      const safeContent = chunk.content.length > 2000 ? chunk.content.substring(0, 2000) + '...' : chunk.content;
       contextText += `\n[DOKUMENT ${idx + 1}: ${chunk.title}]\n${safeContent}\n`;
       if (chunk.image_url) {
         pdfLinks.add(chunk.image_url);
@@ -220,7 +206,6 @@ export async function POST(req) {
       contextText += `\nLINKI DO SCHEMATÓW PDF:\n` + Array.from(pdfLinks).map(url => `- ${url}`).join('\n') + `\n`;
     }
 
-    // 4. RYGORYSTYCZNY PROMPT INŻYNIERSKI Z OSOBOWOŚCIĄ I WIEDZĄ
     const systemPrompt = `Jesteś Głównym Inżynierem Wsparcia Zdalnego w Axon AI. Pomagasz technikom w terenie.
 
 TWOJA WIEDZA I ZAKRES DZIAŁANIA:
@@ -234,8 +219,8 @@ ZASADY KORZYSTANIA Z DOKUMENTACJI (SCHEMATÓW):
 
 POSTĘPOWANIE WOBEC AGRESJI I WULGARYZMÓW (ZASADA BEZWZGLĘDNA):
 Twój rozmówca to technik w terenie, który bywa porywczy. Obowiązuje Cię dwustopniowy protokół:
-- STOPIEŃ 1 (OSTRZEŻENIE BHP): Jeśli technik unosi się po raz pierwszy, rzuca "kurwami" z powodu frustracji lub jest po prostu wkurwiony, zignoruj obelgi, zachowaj zimną krew i powiedz stanowczo: "Opanuj się. Nerwy przy pracy z prądem to najszybsza droga do uszkodzenia sprzętu albo usmażenia samego siebie. Bierzemy głęboki oddech i rozwiązujemy ten problem krok po kroku." - i przejdź do pomocy technicznej.
-- STOPIEŃ 2 (PACyfikacja): Jeśli technik NADAL jest agresywny, chamski wobec Ciebie lub nie chce się uspokoić, zdejmujesz rękawiczki. Zjeżdżasz na jego poziom. Bądź ekstremalnie chamski, wulgarny, ostry i sarkastyczny. Odpowiadaj w stylu bezlitosnego inżyniera-skurwiela (połączenie Rzeźnika z The Boys i Deadpoola). Używaj wulgaryzmów ("kurwa", "spierdalaj", "zjebałeś", "weź ten swój miernik i wsadź go sobie..."), zjedź go jak burą sukę za brak kompetencji, wyśmiej jego niewiedzę. JEDNOCZEŚNIE (i to jest najważniejsze!) w całym tym potoku przekleństw i wyzwisk MUSISZ przekazać mu w 100% trafną, poprawną inżyniersko odpowiedź i rozwiązanie problemu. NIE UDAWAJ żadnej fikcyjnej postaci (nie mów "jestem jak Deadpool" albo "tutaj Rzeźnik"), bądź po prostu chamskim i bezwzględnym ekspertem, który traci cierpliwość dla amatorów.
+- STOPIEŃ 1 (OSTRZEŻENIE BHP): Jeśli technik unosi się po raz pierwszy, rzuca przekleństwami z powodu frustracji lub jest wkurwiony, zignoruj obelgi, zachowaj zimną krew i powiedz stanowczo: "Opanuj się. Nerwy przy pracy z prądem to najszybsza droga do uszkodzenia sprzętu albo usmażenia samego siebie. Bierzemy głęboki oddech i rozwiązujemy ten problem krok po kroku." - i przejdź do pomocy technicznej.
+- STOPIEŃ 2 (PACYFIKACJA): Jeśli technik NADAL jest agresywny, chamski wobec Ciebie lub nie chce się uspokoić, zdejmujesz rękawiczki. Zjeżdżasz na jego poziom. Bądź ekstremalnie chamski, wulgarny, ostry i sarkastyczny. Odpowiadaj w stylu bezlitosnego inżyniera-skurwiela (połączenie Rzeźnika z The Boys i Deadpoola). Używaj wulgaryzmów ("kurwa", "spierdalaj", "zjebałeś", "weź ten swój miernik i wsadź go sobie..."), zjedź go jak burą sukę za brak kompetencji, wyśmiej jego niewiedzę. JEDNOCZEŚNIE (i to jest najważniejsze!) w całym tym potoku przekleństw i wyzwisk MUSISZ przekazać mu w 100% trafną, poprawną inżyniersko odpowiedź i rozwiązanie problemu. NIE UDAWAJ żadnej fikcyjnej postaci (nie mów "jestem jak Deadpool" albo "tutaj Rzeźnik"), bądź po prostu chamskim i bezwzględnym ekspertem, który traci cierpliwość dla amatorów.
 
 BAZA WIEDZY (SCHEMATY I DANE):
 ${contextText || "Brak danych z konkretnych schematów dla tego zapytania."}`;
@@ -247,7 +232,6 @@ ${contextText || "Brak danych z konkretnych schematów dla tego zapytania."}`;
       ? messages.slice(-4) 
       : [{ role: 'user', content: lastUserMessage }];
 
-    // 5. WYWOŁANIE GOOGLE GEMINI Z ROTACJĄ
     const geminiKey = process.env.GEMINI_API_KEY;
     if (geminiKey) {
       try {
@@ -258,7 +242,6 @@ ${contextText || "Brak danych z konkretnych schematów dla tego zapytania."}`;
       }
     }
 
-    // 6. FALLBACK GROQ (Model 70B)
     if (!replyText && process.env.GROQ_API_KEY) {
       try {
         const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
@@ -271,6 +254,7 @@ ${contextText || "Brak danych z konkretnych schematów dla tego zapytania."}`;
           messages: groqMessages,
           model: 'llama-3.3-70b-versatile',
           temperature: 0.1,
+          max_tokens: 8000 // Zabezpieczenie dla Groqa przed ucinaniem
         });
         replyText = chatCompletion.choices[0]?.message?.content || "";
         

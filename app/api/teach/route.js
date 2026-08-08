@@ -135,3 +135,21 @@ export async function POST(req) {
     return NextResponse.json({ success: false, error: error.message }, { status: 500 });
   }
 }
+const handleHardReset = async () => {
+  if (!window.confirm("🚨 UWAGA: To bezpowrotnie usunie WSZYSTKIE schematy z bazy wektorowej i pliki PDF. Baza będzie czysta jak łza. Jesteś pewien?")) return;
+
+  try {
+    // Jeśli masz stan setLoading, możesz go tu odpalić
+    const res = await fetch('/api/reset', { method: 'POST' });
+    const data = await res.json();
+    
+    if (res.ok) {
+      alert("✅ Sukces! " + data.message);
+      // Jeśli masz funkcję pobierającą listę dokumentów (np. fetchDocuments), wywołaj ją tu by odświeżyć widok
+    } else {
+      alert("❌ Błąd: " + data.error);
+    }
+  } catch (err) {
+    alert("❌ Błąd komunikacji z serwerem.");
+  }
+};
