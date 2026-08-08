@@ -11,7 +11,7 @@ function getSupabase() {
   return createClient(url, key);
 }
 
-// Pobieranie wektora dla pytania użytkownika
+// Pobieranie wektora zapytania
 async function getEmbedding(text) {
   const apiKey = process.env.HF_API_KEY;
   if (!apiKey) return null;
@@ -55,9 +55,9 @@ export async function POST(req) {
     const supabase = getSupabase();
 
     const body = await req.json();
-    const { messages = [], prompt = '' } = body;
+    const { messages = [], prompt = '', message = '' } = body;
 
-    const lastUserMessage = prompt || (messages.length > 0 ? messages[messages.length - 1].content : '');
+    const lastUserMessage = prompt || message || (messages.length > 0 ? messages[messages.length - 1].content : '');
 
     if (!lastUserMessage) {
       return NextResponse.json({ error: "Brak pytania." }, { status: 400 });
@@ -65,55 +65,71 @@ export async function POST(req) {
 
     let contextChunks = [];
 
-    // 1. SZUKANIE WEKTOROWE W ai_memory
+    // 1. WYSZUKIWANIE WEKTOROWE W ai_memory
     const queryEmbedding = await getEmbedding(lastUserMessage);
 
     if (queryEmbedding) {
       try {
         const { data: vectorData } = await supabase.rpc('match_ai_memory', {
           query_embedding: queryEmbedding,
-          match_threshold: 0.05,
-          match_count: 6
+          match_threshold: 0.01,
+          match_count: 8
         });
 
         if (vectorData && vectorData.length > 0) {
           contextChunks = vectorData;
         }
       } catch (e) {
-        console.warn("Błąd match_ai_memory, przejście do wyszukiwania tekstowego:", e.message);
+        console.warn("Błąd match_ai_memory:", e.message);
       }
     }
 
-    // 2. SZUKANIE TEKSTOWE / SYMBOLI W ai_memory
+    // 2. BEZPIECZNE WYSZUKIWANIE TEKSTOWE
     if (contextChunks.length === 0) {
-      const keywords = lastUserMessage
+      // Wyciąganie bezpiecznych symboli technicznych (np. 1A8, 3-21-52.0189)
+      const cleanTerms = lastUserMessage
         .replace(/[^a-zA-Z0-9.-]/g, ' ')
         .split(' ')
         .filter(w => w.length >= 2);
 
-      let query = supabase.from('ai_memory').select('*').limit(8);
+      try {
+        for (const term of cleanTerms) {
+          const { data: searchResults } = await supabase
+            .from('ai_memory')
+            .select('*')
+            .or(`title.ilike.%${term}%,content.ilike.%${term}%`)
+            .limit(6);
 
-      if (keywords.length > 0) {
-        const filterConditions = keywords.map(w => `title.ilike.%${w}%,content.ilike.%${w}%`).join(',');
-        query = query.or(filterConditions);
+          if (searchResults && searchResults.length > 0) {
+            contextChunks.push(...searchResults);
+          }
+        }
+      } catch (err) {
+        console.warn("Błąd wyszukiwania słów kluczowych:", err.message);
       }
 
-      const { data: textData } = await query;
-      if (textData && textData.length > 0) {
-        contextChunks = textData;
-      } else {
-        // Fallback: pobranie najnowszych wpisów z ai_memory
-        const { data: recentData } = await supabase.from('ai_memory').select('*').order('id', { ascending: false }).limit(6);
+      // Fallback: Zawsze pobierz ostatnie wpisy z ai_memory w przypadku braku dopasowań
+      if (contextChunks.length === 0) {
+        const { data: recentData } = await supabase
+          .from('ai_memory')
+          .select('*')
+          .order('id', { ascending: false })
+          .limit(6);
+
         if (recentData) contextChunks = recentData;
       }
     }
 
-    // 3. PRZYGOTOWANIE TREŚCI DLA AI
+    // Usuwanie ewentualnych powtórzeń w znalezionych rekordach
+    const uniqueChunks = Array.from(new Set(contextChunks.map(c => c.id)))
+      .map(id => contextChunks.find(c => c.id === id));
+
+    // 3. PRZYGOTOWANIE TREŚCI DLA MODELU
     let contextText = "";
     const pdfLinks = new Set();
 
-    contextChunks.forEach((chunk, idx) => {
-      contextText += `\n--- FRAGMENT DOKUMENTACJI ${idx + 1} (${chunk.title}) ---\n${chunk.content}\n`;
+    uniqueChunks.forEach((chunk, idx) => {
+      contextText += `\n--- DOKUMENTACJA ${idx + 1} (${chunk.title}) ---\n${chunk.content}\n`;
       if (chunk.image_url) {
         pdfLinks.add(chunk.image_url);
       }
@@ -125,11 +141,11 @@ export async function POST(req) {
 
     // 4. SYSTEM PROMPT
     const systemPrompt = `Jesteś Głównym Inżynierem Serwisu Axon AI. 
-Odpowiadaj bardzo precyzyjnie i technicznie na podstawie podanej BAZY WIEDZY.
-Jeżeli w BAZIE WIEDZY znajduje się link URL do pliku PDF ze schematem, ZAWSZE umieść go w odpowiedzi jako klikalny odnośnik w formacie Markdown: [Pobierz/Otwórz Schemat PDF](URL).
+Odpowiadaj precyzyjnie, zwięźle i bardzo technicznie na podstawie BAZY WIEDZY.
+Jeżeli w BAZIE WIEDZY znajduje się link URL do pliku PDF, ZAWSZE dołącz go w odpowiedzi w formacie Markdown: [Pobierz/Otwórz Schemat PDF](URL).
 
-BAZA WIEDZY DOKUMENTACJI TECHNICZNEJ (Z TABELI ai_memory):
-${contextText || "Brak pasujących informacji w bazie wiedzy."}`;
+BAZA WIEDZY Z TABELI ai_memory:
+${contextText || "Brak szczegółów w bazie."}`;
 
     const formattedMessages = [
       { role: 'system', content: systemPrompt },
@@ -140,19 +156,30 @@ ${contextText || "Brak pasujących informacji w bazie wiedzy."}`;
       formattedMessages.push({ role: 'user', content: lastUserMessage });
     }
 
-    // 5. ZAPYTANIE DO GROQ (LLAMA 70B)
+    // 5. WYWOŁANIE MODELU GROQ
     const chatCompletion = await groq.chat.completions.create({
       messages: formattedMessages,
       model: 'llama-3.3-70b-versatile',
       temperature: 0.1,
     });
 
-    const reply = chatCompletion.choices[0]?.message?.content || "Brak odpowiedzi od AI.";
+    const replyText = chatCompletion.choices[0]?.message?.content || "Brak odpowiedzi od AI.";
 
-    return NextResponse.json({ role: 'assistant', content: reply });
+    // Uniwersalna struktura danych JSON pasująca do każdego interfejsu
+    return NextResponse.json({
+      role: 'assistant',
+      content: replyText,
+      reply: replyText,
+      message: replyText,
+      text: replyText
+    });
 
   } catch (error) {
     console.error("Błąd w trakcie czatu:", error);
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    return NextResponse.json({ 
+      error: error.message,
+      content: `Błąd serwera: ${error.message}`,
+      reply: `Błąd serwera: ${error.message}`
+    }, { status: 500 });
   }
 }
