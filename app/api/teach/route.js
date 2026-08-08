@@ -12,10 +12,10 @@ function getSupabase() {
   return createClient(url, key);
 }
 
-// Odporna funkcja wektoryzacji z podwójnym endpointem i próbami ponowienia
+// Odporna funkcja wektoryzacji wykonująca zapytania w sposób sekwencyjny
 async function getEmbedding(text) {
   const apiKey = process.env.HF_API_KEY;
-  if (!apiKey) throw new Error("Brak klucza HF_API_KEY");
+  if (!apiKey) throw new Error("Brak klucza HF_API_KEY w zmiennych środowiskowych.");
 
   const endpoints = [
     "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2",
@@ -26,27 +26,31 @@ async function getEmbedding(text) {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const response = await fetch(url, {
+          method: "POST",
           headers: { 
-            Authorization: `Bearer ${apiKey}`, 
+            "Authorization": `Bearer ${apiKey}`, 
             "Content-Type": "application/json",
+            "User-Agent": "AxonAI-App/1.0",
             "x-wait-for-model": "true" 
           },
-          method: "POST",
           body: JSON.stringify({ inputs: text, options: { wait_for_model: true } }),
+          cache: "no-store"
         });
 
         if (response.ok) {
           const result = await response.json();
           if (Array.isArray(result) && Array.isArray(result[0])) return result[0];
-          if (Array.isArray(result)) return result;
+          if (Array.isArray(result) && typeof result[0] === 'number') return result;
         }
       } catch (err) {
-        console.warn(`Próba połączenia z ${url} (próba ${attempt + 1}) nie powiodła się:`, err.message);
+        console.warn(`Nieudana próba wektoryzacji (${url}):`, err.message);
       }
+      // Krótka pauza przed ewentualną ponowną próbą
+      await new Promise((res) => setTimeout(res, 300));
     }
   }
 
-  throw new Error("Błąd Hugging Face: Serwer wektoryzacji nie odpowiada po kilku próbach.");
+  return null;
 }
 
 export async function POST(req) {
@@ -178,34 +182,35 @@ Podziel skomplikowane tabele na czytelne fragmenty dla inżyniera.`;
 
     if (!Array.isArray(chunks)) chunks = [chunks];
 
-    // RÓWNOLEGŁA WEKTORYZACJA
-    const recordPromises = chunks.map(async (chunk) => {
-      if (!chunk.title || !chunk.content) return null;
-      try {
-        const embedding = await getEmbedding(`${chunk.title}: ${chunk.content}`);
-        if (embedding) {
-          return { title: chunk.title, content: chunk.content, embedding, image_url: fileUrl };
-        }
-      } catch (err) {
-        console.error("Błąd wektoryzacji fragmentu:", err);
+    // SEKWENCYJNA WEKTORYZACJA (zabezpiecza przed odrzuceniem połączenia)
+    const records = [];
+    for (const chunk of chunks) {
+      if (!chunk.title || !chunk.content) continue;
+      
+      const embedding = await getEmbedding(`${chunk.title}: ${chunk.content}`);
+      if (embedding) {
+        records.push({
+          title: chunk.title,
+          content: chunk.content,
+          embedding,
+          image_url: fileUrl
+        });
       }
-      return null;
-    });
-
-    const records = (await Promise.all(recordPromises)).filter(Boolean);
-
-    if (chunks.length > 0 && records.length === 0) {
-      throw new Error("Usługa Hugging Face nie zgenerowała wektorów. Spróbuj ponownie za chwilę.");
+      
+      // Odstęp czasowy chroniący przed przeciążeniem API
+      await new Promise((resolve) => setTimeout(resolve, 250));
     }
 
     if (records.length > 0) {
       const { error: dbError } = await supabase.from('memories').insert(records);
       if (dbError) throw dbError;
+    } else if (chunks.length > 0) {
+      throw new Error("Nie udało się wygenerować wektorów w Hugging Face. Spróbuj ponownie.");
     }
 
     return NextResponse.json({
       success: true,
-      message: `Przeanalizowano plik i dodano ${records.length} wpisów do bazy wiedzy!`
+      message: `Przeanalizowano dokument i zapisano ${records.length} fragmentów w bazie wiedzy!`
     });
 
   } catch (error) {
