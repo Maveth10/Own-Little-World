@@ -11,7 +11,7 @@ function getSupabase() {
   return createClient(url, key);
 }
 
-// Funkcja dzieląca tekst na nakładające się fragmenty (zabezpieczenie styków stron)
+// Dzielenie tekstu z nakładaniem się styków stron
 function chunkTextWithOverlap(text, chunkSize = 1200, overlap = 250) {
   const chunks = [];
   let start = 0;
@@ -27,7 +27,7 @@ function chunkTextWithOverlap(text, chunkSize = 1200, overlap = 250) {
   return chunks;
 }
 
-// Zbiorcza wektoryzacja w Hugging Face (1 zapytanie HTTP dla wszystkich fragmentów)
+// Zbiorcze pobieranie wektorów w jednym zapytaniu HTTP
 async function getBatchEmbeddings(textArray) {
   const apiKey = process.env.HF_API_KEY;
   if (!apiKey) return textArray.map(() => new Array(384).fill(0));
@@ -35,6 +35,9 @@ async function getBatchEmbeddings(textArray) {
   const url = "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2";
 
   try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 2500);
+
     const response = await fetch(url, {
       method: "POST",
       headers: { 
@@ -43,21 +46,23 @@ async function getBatchEmbeddings(textArray) {
         "User-Agent": "AxonAI-App/1.0",
         "x-wait-for-model": "true" 
       },
-      body: JSON.stringify({ inputs: textArray, options: { wait_for_model: true } }),
+      body: JSON.stringify({ inputs: textArray.map(t => t.slice(0, 1000)), options: { wait_for_model: true } }),
+      signal: controller.signal,
       cache: "no-store"
     });
+
+    clearTimeout(timeoutId);
 
     if (response.ok) {
       const result = await response.json();
       if (Array.isArray(result) && Array.isArray(result[0])) {
-        return result; // Zwraca tablicę wektorów dla wszystkich fragmentów naraz
+        return result;
       }
     }
   } catch (err) {
-    console.warn("Błąd wektoryzacji pakietyzowanej HF:", err.message);
+    console.warn("Wektoryzacja zbiorcza przekroczyła czas, używanie wektorów rezerwowych:", err.message);
   }
 
-  // W razie chwilowej niedostępności HF zwraca wektory zerowe bez przerywania zapisu
   return textArray.map(() => new Array(384).fill(0));
 }
 
@@ -77,20 +82,17 @@ export async function POST(req) {
     const isPdf = fileUrl && (fileType === 'application/pdf' || fileName.endsWith('.pdf'));
 
     if (isPdf) {
-      // 1. Szybkie pobranie PDF z Supabase Storage
       const pdfRes = await fetch(fileUrl);
       if (!pdfRes.ok) throw new Error("Nie udało się pobrać pliku PDF z magazynu Supabase.");
       const buffer = Buffer.from(await pdfRes.arrayBuffer());
 
-      // 2. Ekstrakcja czystego tekstu cyfrowego z dokumentu CAD/EPLAN
       const pdfData = await pdfParse(buffer);
       const extractedText = pdfData.text || "";
 
       if (!extractedText.trim()) {
-        throw new Error("Plik PDF nie zawiera warstwy tekstowej (prawdopodobnie skan).");
+        throw new Error("Plik PDF nie zawiera warstwy tekstowej.");
       }
 
-      // 3. Podział na nakładające się fragmenty (zachowuje ciągłość między stronami)
       const rawChunks = chunkTextWithOverlap(extractedText, 1200, 250);
       textChunks = rawChunks.map((chunk, index) => ({
         title: `${fileName || 'Dokumentacja'} - Część ${index + 1}`,
@@ -98,7 +100,6 @@ export async function POST(req) {
       }));
 
     } else {
-      // Sama notatka tekstowa
       const rawChunks = chunkTextWithOverlap(userInput, 1200, 250);
       textChunks = rawChunks.map((chunk, index) => ({
         title: title ? `${title} (Część ${index + 1})` : `Notatka ${index + 1}`,
@@ -110,11 +111,10 @@ export async function POST(req) {
       return NextResponse.json({ success: false, error: "Brak treści do zapisania." }, { status: 400 });
     }
 
-    // 4. Pobranie wektorów w jednym zbiorczym zapytaniu HTTP
     const prepTexts = textChunks.map(c => `${c.title}: ${c.content}`);
     const embeddings = await getBatchEmbeddings(prepTexts);
 
-    // 5. Złożenie rekordów i błyskawiczny zapis do Supabase
+    // ZAPIS DO TABELI ai_memory
     const records = textChunks.map((chunk, i) => ({
       title: chunk.title,
       content: chunk.content,
@@ -122,12 +122,12 @@ export async function POST(req) {
       image_url: fileUrl
     }));
 
-    const { error: dbError } = await supabase.from('memories').insert(records);
+    const { error: dbError } = await supabase.from('ai_memory').insert(records);
     if (dbError) throw dbError;
 
     return NextResponse.json({
       success: true,
-      message: `Przetworzono bezbłędnie! Zapisano ${records.length} połączonych fragmentów dokumentu w bazie wiedzy.`
+      message: `Przetworzono! Zapisano ${records.length} fragmentów w tabeli ai_memory.`
     });
 
   } catch (error) {
