@@ -11,14 +11,14 @@ function getSupabase() {
   return createClient(url, key);
 }
 
-// Dzielenie tekstu z nakładaniem się styków stron
-function chunkTextWithOverlap(text, chunkSize = 1200, overlap = 250) {
+// Precyzyjne cięcie tekstu z dużą zakładką (idealne dla schematów i tabel)
+function chunkTextWithOverlap(text, chunkSize = 600, overlap = 200) {
   const chunks = [];
   let start = 0;
   while (start < text.length) {
     const end = Math.min(start + chunkSize, text.length);
     const chunk = text.slice(start, end).trim();
-    if (chunk.length > 50) {
+    if (chunk.length > 30) {
       chunks.push(chunk);
     }
     if (end === text.length) break;
@@ -27,43 +27,47 @@ function chunkTextWithOverlap(text, chunkSize = 1200, overlap = 250) {
   return chunks;
 }
 
-// Zbiorcze pobieranie wektorów w jednym zapytaniu HTTP
-async function getBatchEmbeddings(textArray) {
-  const apiKey = process.env.HF_API_KEY;
-  if (!apiKey) return textArray.map(() => new Array(384).fill(0));
+// ZBIORCZE POBIERANIE WEKTORÓW GOOGLE GEMINI (text-embedding-004, 768 WYMIARÓW)
+async function getBatchEmbeddingsGemini(textArray) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new Error("Brak klucza GEMINI_API_KEY do wygenerowania wektorów!");
+  }
 
-  const url = "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2";
+  const batchSize = 30; // Bezpieczny rozmiar paczki dla API Google
+  const allEmbeddings = [];
 
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 2500);
+  for (let i = 0; i < textArray.length; i += batchSize) {
+    const chunkArray = textArray.slice(i, i + batchSize);
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents?key=${apiKey}`;
+
+    const requests = chunkArray.map(t => ({
+      model: "models/text-embedding-004",
+      content: { parts: [{ text: t.slice(0, 8000) }] }
+    }));
 
     const response = await fetch(url, {
       method: "POST",
-      headers: { 
-        "Authorization": `Bearer ${apiKey}`, 
-        "Content-Type": "application/json",
-        "User-Agent": "AxonAI-App/1.0",
-        "x-wait-for-model": "true" 
-      },
-      body: JSON.stringify({ inputs: textArray.map(t => t.slice(0, 1000)), options: { wait_for_model: true } }),
-      signal: controller.signal,
-      cache: "no-store"
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ requests })
     });
 
-    clearTimeout(timeoutId);
-
-    if (response.ok) {
-      const result = await response.json();
-      if (Array.isArray(result) && Array.isArray(result[0])) {
-        return result;
-      }
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`Błąd Google Gemini Embeddings (${response.status}): ${errText}`);
     }
-  } catch (err) {
-    console.warn("Wektoryzacja zbiorcza przekroczyła czas, używanie wektorów rezerwowych:", err.message);
+
+    const data = await response.json();
+    const embeddings = data.embeddings?.map(e => e.values) || [];
+    
+    if (embeddings.length === 0) {
+      throw new Error("Google Gemini odrzuciło generowanie wektorów.");
+    }
+
+    allEmbeddings.push(...embeddings);
   }
 
-  return textArray.map(() => new Array(384).fill(0));
+  return allEmbeddings;
 }
 
 export async function POST(req) {
@@ -93,17 +97,22 @@ export async function POST(req) {
         throw new Error("Plik PDF nie zawiera warstwy tekstowej.");
       }
 
-      const rawChunks = chunkTextWithOverlap(extractedText, 1200, 250);
+      // Zagęszczony chunking (600 znaków z 200 zakładki)
+      const rawChunks = chunkTextWithOverlap(extractedText, 600, 200);
+      
+      const docName = fileName || 'Dokumentacja';
       textChunks = rawChunks.map((chunk, index) => ({
-        title: `${fileName || 'Dokumentacja'} - Część ${index + 1}`,
-        content: chunk
+        title: `${docName} - Część ${index + 1}`,
+        // Kluczowe: doklejamy nazwę pliku bezpośrednio do Treści, aby wektor wiedział, jakiego pliku dotyczy każdy akapit!
+        content: `[DOKUMENT: ${docName}]\n${chunk}`
       }));
 
     } else {
-      const rawChunks = chunkTextWithOverlap(userInput, 1200, 250);
+      const rawChunks = chunkTextWithOverlap(userInput, 600, 200);
+      const docName = title || 'Notatka';
       textChunks = rawChunks.map((chunk, index) => ({
         title: title ? `${title} (Część ${index + 1})` : `Notatka ${index + 1}`,
-        content: chunk
+        content: `[NOTATKA: ${docName}]\n${chunk}`
       }));
     }
 
@@ -111,23 +120,27 @@ export async function POST(req) {
       return NextResponse.json({ success: false, error: "Brak treści do zapisania." }, { status: 400 });
     }
 
-    const prepTexts = textChunks.map(c => `${c.title}: ${c.content}`);
-    const embeddings = await getBatchEmbeddings(prepTexts);
+    // Przygotowanie połączonych tekstów do wygenerowania wektorów
+    const prepTexts = textChunks.map(c => `${c.title}:\n${c.content}`);
+    
+    // Generowanie wektorów przez Google Gemini (768 wymiarów)
+    const embeddings = await getBatchEmbeddingsGemini(prepTexts);
 
-    // ZAPIS DO TABELI ai_memory
+    // Przygotowanie rekordów do tabeli ai_memory
     const records = textChunks.map((chunk, i) => ({
       title: chunk.title,
       content: chunk.content,
-      embedding: embeddings[i] || new Array(384).fill(0),
+      embedding: embeddings[i],
       image_url: fileUrl
     }));
 
+    // ZAPIS DO TABELI ai_memory
     const { error: dbError } = await supabase.from('ai_memory').insert(records);
     if (dbError) throw dbError;
 
     return NextResponse.json({
       success: true,
-      message: `Przetworzono! Zapisano ${records.length} fragmentów w tabeli ai_memory.`
+      message: `Przetworzono pomyślnie na silniku Google Gemini! Zapisano ${records.length} precyzyjnych fragmentów w ai_memory.`
     });
 
   } catch (error) {
@@ -135,21 +148,3 @@ export async function POST(req) {
     return NextResponse.json({ success: false, error: error.message }, { status: 500 });
   }
 }
-const handleHardReset = async () => {
-  if (!window.confirm("🚨 UWAGA: To bezpowrotnie usunie WSZYSTKIE schematy z bazy wektorowej i pliki PDF. Baza będzie czysta jak łza. Jesteś pewien?")) return;
-
-  try {
-    // Jeśli masz stan setLoading, możesz go tu odpalić
-    const res = await fetch('/api/reset', { method: 'POST' });
-    const data = await res.json();
-    
-    if (res.ok) {
-      alert("✅ Sukces! " + data.message);
-      // Jeśli masz funkcję pobierającą listę dokumentów (np. fetchDocuments), wywołaj ją tu by odświeżyć widok
-    } else {
-      alert("❌ Błąd: " + data.error);
-    }
-  } catch (err) {
-    alert("❌ Błąd komunikacji z serwerem.");
-  }
-};

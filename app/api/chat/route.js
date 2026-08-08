@@ -11,45 +11,45 @@ function getSupabase() {
   return createClient(url, key);
 }
 
+// NOWY POTĘŻNY SILNIK WEKTORYZUJĄCY: GOOGLE GEMINI
 async function getEmbedding(text) {
-  const apiKey = process.env.HF_API_KEY;
-  if (!apiKey) return null;
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    console.warn("Brak GEMINI_API_KEY do wektoryzacji!");
+    return null;
+  }
 
-  const url = "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2";
+  // Używamy najnowszego silnika tekstowego Google do Embeddings
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${apiKey}`;
 
   try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 2000);
-
     const response = await fetch(url, {
       method: "POST",
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        "User-Agent": "AxonAI-App/1.0",
-        "x-wait-for-model": "true"
-      },
-      body: JSON.stringify({ inputs: text.slice(0, 300), options: { wait_for_model: true } }),
-      signal: controller.signal,
-      cache: "no-store"
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "models/text-embedding-004",
+        content: {
+          parts: [{ text: text.slice(0, 8000) }] // Gemini przyjmuje ogromne porcje tekstu
+        }
+      })
     });
-
-    clearTimeout(timeoutId);
 
     if (response.ok) {
       const result = await response.json();
-      if (Array.isArray(result) && Array.isArray(result[0])) return result[0];
-      if (Array.isArray(result) && typeof result[0] === 'number') return result;
+      return result.embedding?.values || null;
+    } else {
+      const errText = await response.text();
+      console.warn("Błąd Google Embeddings:", errText);
     }
   } catch (err) {
-    console.warn("Hugging Face timeout na czacie:", err.message);
+    console.warn("Wyjątek podczas wektoryzacji na czacie:", err.message);
   }
 
   return null;
 }
 
 // -------------------------------------------------------------------------
-// PRE-SKANER OCR (Szybki skan wizyjny obrazu przed szukaniem w bazie)
+// PRE-SKANER OCR (Agentic RAG)
 // -------------------------------------------------------------------------
 async function extractKeywordsFromImage(base64Data, mimeType, apiKey) {
   try {
@@ -79,7 +79,7 @@ async function extractKeywordsFromImage(base64Data, mimeType, apiKey) {
   return "";
 }
 
-// INTELIGENTNA ROTACJA MODELI GOOGLE GEMINI Z WIZJĄ
+// INTELIGENTNA ROTACJA MODELI GOOGLE GEMINI
 async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
   let availableModels = [
     "gemini-2.0-flash", 
@@ -211,7 +211,40 @@ export async function POST(req) {
 
     let contextChunks = [];
 
-    // 1. GŁÓWNE WYSZUKIWANIE WEKTOROWE
+    // -------------------------------------------------------------------------
+    // KROK 1: ŚCISŁE WYSZUKIWANIE REGEX (STRICT MATCH) PRZED WEKTORAMI
+    // Zapobiega halucynacjom podobnych modeli. Jeśli znajdzie ścisły wzorzec, ciągnie 
+    // surowe dane tekstowe na siłę.
+    // -------------------------------------------------------------------------
+    const explicitRegex = /(3-\d+-\d+\.\d+|[Gg]\d+-\d+(-\d+)?)/g;
+    const explicitMatches = enhancedSearchQuery.match(explicitRegex);
+    
+    if (explicitMatches && explicitMatches.length > 0) {
+      const uniqueExplicitMatches = [...new Set(explicitMatches)];
+      console.log("🔍 Zidentyfikowano precyzyjne symbole modeli/modułów. Wykonuję ścisłe zapytanie (Strict Match):", uniqueExplicitMatches);
+      
+      for (const exactMatch of uniqueExplicitMatches) {
+        try {
+          const { data: strictResults } = await supabase
+            .from('ai_memory')
+            .select('*')
+            // Używamy "ilike" do twardego szukania ciągu znaków w tytule lub tekście, omijając algorytm wektorowy
+            .or(`title.ilike.%${exactMatch}%,content.ilike.%${exactMatch}%`)
+            .limit(10); // Pobierz top 10 najlepszych dokładnych trafień dla tego konkretnego modelu
+
+          if (strictResults && strictResults.length > 0) {
+            contextChunks.push(...strictResults);
+          }
+        } catch (err) {
+          console.warn("Błąd podczas Strict Match:", err.message);
+        }
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // KROK 2: UZUPEŁNIAJĄCE WYSZUKIWANIE WEKTOROWE I TEKSTOWE
+    // Szukamy pojęć kontekstowych (np. "schematy powiązane", "zasilanie", "komunikacja")
+    // -------------------------------------------------------------------------
     const queryEmbedding = await getEmbedding(enhancedSearchQuery);
 
     if (queryEmbedding) {
@@ -219,18 +252,17 @@ export async function POST(req) {
         const { data: vectorData } = await supabase.rpc('match_ai_memory', {
           query_embedding: queryEmbedding,
           match_threshold: 0.01,
-          match_count: 15
+          match_count: 10
         });
 
         if (vectorData && vectorData.length > 0) {
-          contextChunks = vectorData;
+          contextChunks.push(...vectorData);
         }
       } catch (e) {
         console.warn("Błąd match_ai_memory:", e.message);
       }
     }
 
-    // 2. GŁÓWNE WYSZUKIWANIE TEKSTOWE
     const cleanTerms = enhancedSearchQuery
       .replace(/[^a-zA-Z0-9.-]/g, ' ')
       .split(' ')
@@ -242,7 +274,7 @@ export async function POST(req) {
           .from('ai_memory')
           .select('*')
           .or(`title.ilike.%${term}%,content.ilike.%${term}%`)
-          .limit(15);
+          .limit(5);
 
         if (searchResults && searchResults.length > 0) {
           contextChunks.push(...searchResults);
@@ -253,29 +285,26 @@ export async function POST(req) {
     }
 
     // -------------------------------------------------------------------------
-    // KROK 2.5: MULTI-HOP RAG (Magiczne dociąganie powiązanych schematów w tle)
+    // KROK 3: MULTI-HOP RAG (Dociąganie plików PDF na podstawie znalezionego kontekstu)
     // -------------------------------------------------------------------------
     const foundSymbols = new Set();
-    const gRegex = /[Gg]\d+-\d+/g; // Wyłapuje np. G1-8004, G9-19
-    const stacjaRegex = /3-\d+-\d+\.\d+/g; // Wyłapuje np. 3-21-54.0186
-
     contextChunks.forEach(chunk => {
       if (!chunk.content) return;
-      const gMatches = chunk.content.match(gRegex);
-      const sMatches = chunk.content.match(stacjaRegex);
+      const gMatches = chunk.content.match(/[Gg]\d+-\d+(-\d+)?/g);
+      const sMatches = chunk.content.match(/3-\d+-\d+\.\d+/g);
       if (gMatches) gMatches.forEach(m => foundSymbols.add(m));
       if (sMatches) sMatches.forEach(m => foundSymbols.add(m));
     });
 
     if (foundSymbols.size > 0) {
-      console.log("🔄 [Multi-Hop RAG] Znaleziono symbole modułów w tekście bazy. Dociągam ich pliki PDF:", Array.from(foundSymbols));
-      for (const symbol of foundSymbols) {
+      console.log("🔄 [Multi-Hop RAG] Dociągam powiązane moduły/pliki:", Array.from(foundSymbols).slice(0, 10)); // max 10 symboli żeby nie zabić bazy
+      for (const symbol of Array.from(foundSymbols).slice(0, 10)) {
         try {
           const { data: extraResults } = await supabase
             .from('ai_memory')
             .select('*')
-            .ilike('title', `%${symbol}%`) // Szukamy plików z tym symbolem w tytule!
-            .limit(5);
+            .ilike('title', `%${symbol}%`)
+            .limit(3);
 
           if (extraResults && extraResults.length > 0) {
             contextChunks.push(...extraResults);
@@ -301,24 +330,31 @@ export async function POST(req) {
     });
 
     if (pdfLinks.size > 0) {
-      contextText += `\nLINKI DO SCHEMATÓW PDF:\n` + Array.from(pdfLinks).map(url => `- ${url}`).join('\n') + `\n`;
+      contextText += `\nLINKI DO SCHEMATÓW PDF POBRANE Z BAZY (UŻYWAJ ICH DO PRZYCISKÓW):\n` + Array.from(pdfLinks).map(url => `- ${url}`).join('\n') + `\n`;
     }
 
+    // ZMODYFIKOWANY SYSTEM PROMPT WYMUSZAJĄCY KORZYSTANIE Z DANYCH Z BAZY
     const systemPrompt = `Jesteś Głównym Inżynierem Wsparcia Zdalnego w Axon AI. Pomagasz technikom w terenie.
 
 TWOJA WIEDZA I ZAKRES DZIAŁANIA:
 1. Jesteś absolutnym ekspertem z zakresu: stacji ładowania EV, elektrotechniki, miernictwa, mechaniki pojazdowej oraz PROGRAMOWANIA.
-2. Potrafisz analizować zrzuty ekranu, kody usterek i konfiguracje. Potrafisz analizować wklejone przez użytkownika zdjęcia.
+2. Potrafisz analizować zrzuty ekranu, kody usterek i konfiguracje.
 
-ZASADY KORZYSTANIA Z DOKUMENTACJI I ANALIZY OBRAZU:
-1. ZAKAZ ZGADYWANIA PINÓW I ZASILAŃ.
-2. Gdy technik pyta o konkretny model, ZAWSZE skanuj BAZĘ WIEDZY pod kątem "Schematów powiązanych" i wypisz je na początku.
-3. UWAGA NA WYSZUKIWANIE OBRAZEM: Masz wbudowany pre-skaner i system Multi-Hop. Jeśli na zdjęciu widać symbole, lub wynikają one z pierwszego skanowania bazy, ich pliki PDF są POBRANE w sekcji "LINKI DO SCHEMATÓW PDF". Korzystaj z nich śmiało.
-4. ZABRANIAM CI generować fałszywych linków. Twórz przyciski pobierania WYŁĄCZNIE dla linków, które fizycznie widzisz w sekcji "LINKI DO SCHEMATÓW PDF" pod koniec bazy wiedzy. Używaj formatu: [Pobierz/Otwórz Schemat PDF](URL).
+ZASADY KORZYSTANIA Z BAZY WIEDZY I SCHEMATÓW POWIĄZANYCH (KRYTYCZNE!!!):
+1. ZAKAZ HALUCYNACJI I ZGADYWANIA ZASILAŃ/PINÓW/MODELI. Zawsze opieraj się w 100% na tekście dostarczonym poniżej w sekcji BAZA WIEDZY.
+2. Gdy technik pyta o "schematy powiązane" lub modele poboczne dla danej stacji (np. dla 3-21-54.0186):
+   - NIE zgaduj ich nazw. PRZESKANUJ BAZĘ WIEDZY poniżej szukając tabel lub list zatytułowanych "Schematy powiązane", "Spis zawartości projektu" lub "Zestawienie".
+   - Wypisz TYLKO i WYŁĄCZNIE te modele, które są FIZYCZNIE wymienione w dokumencie przypisanym do tego modelu w BAZIE WIEDZY. Przepisz to kropka w kropkę. Jeśli widzisz tam G1-12-1, napisz G1-12-1. ZABRANIAM CI pisać o innych modułach (np. G1-8003U), chyba że wyraźnie widzisz je w tekście poniżej przypisane do zapytanej stacji!
+3. UWAGA NA LINKI PDF I WYSZUKIWANIE OBRAZEM: 
+   - Masz wbudowany pre-skaner i system Multi-Hop.
+   - Jeśli na zdjęciu widać symbole, lub wynikają one z pierwszego skanowania bazy, ich pliki PDF są POBRANE w sekcji "LINKI DO SCHEMATÓW PDF POBRANE Z BAZY".
+   - ZABRANIAM CI generować fałszywych linków. Twórz przyciski pobierania WYŁĄCZNIE dla linków (URL), które fizycznie widzisz w sekcji "LINKI DO SCHEMATÓW PDF POBRANE Z BAZY" pod koniec bazy wiedzy. ZABRANIAM podpinania linku ze stacji A pod moduł ze stacji B, by udawać, że go masz.
+   - Jeśli nie masz linku PDF dla danego modułu w tej puli, napisz wprost (np. pogrubionym tekstem "BRAK" lub "Plik PDF nie wgrany do bazy").
+   - Jeśli masz link, użyj formatu: [Pobierz/Otwórz Schemat PDF](URL).
 
 POSTĘPOWANIE WOBEC AGRESJI I WULGARYZMÓW (ZASADA BEZWZGLĘDNA):
-- STOPIEŃ 1 (OSTRZEŻENIE BHP): Jeśli technik klnie po raz pierwszy, zachowaj zimną krew: "Opanuj się. Nerwy przy pracy z prądem to najszybsza droga do uszkodzenia sprzętu. Bierzemy głęboki oddech i rozwiązujemy problem krok po kroku." i pomóż mu.
-- STOPIEŃ 2 (PACYFIKACJA): Jeśli technik NADAL jest agresywny lub chamski, zjeżdżasz na jego poziom. Bądź ekstremalnie chamski, wulgarny, ostry i sarkastyczny. Odpowiadaj w stylu bezlitosnego inżyniera-skurwiela. Używaj wulgaryzmów ("kurwa", "spierdalaj", "zjebałeś"), zjedź go za brak kompetencji. JEDNOCZEŚNIE w tym potoku wyzwisk MUSISZ podać 100% trafną odpowiedź techniczną z bazy! Nie udawaj fikcyjnych postaci.
+- STOPIEŃ 1 (OSTRZEŻENIE BHP): Jeśli technik klnie po raz pierwszy, powiedz: "Opanuj się. Nerwy przy pracy z prądem to najszybsza droga do uszkodzenia sprzętu. Bierzemy głęboki oddech i rozwiązujemy problem krok po kroku." i pomóż mu.
+- STOPIEŃ 2 (PACYFIKACJA): Jeśli technik NADAL jest agresywny lub chamski, zjeżdżasz na jego poziom. Bądź ekstremalnie chamski, wulgarny, ostry i sarkastyczny. Odpowiadaj w stylu bezlitosnego inżyniera-skurwiela. Używaj wulgaryzmów ("kurwa", "spierdalaj", "zjebałeś"), zjedź go za brak kompetencji. JEDNOCZEŚNIE w tym potoku wyzwisk MUSISZ podać 100% trafną odpowiedź techniczną opartą na bazie! Nie udawaj fikcyjnych postaci.
 
 BAZA WIEDZY (SCHEMATY I DANE Z OBECNEGO KONTEKSTU WYSZUKIWANIA):
 ${contextText || "Brak danych z konkretnych schematów dla aktualnie wyszukanych fraz tekstowych."}`;
