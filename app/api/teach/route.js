@@ -12,45 +12,38 @@ function getSupabase() {
   return createClient(url, key);
 }
 
-// Odporna funkcja wektoryzacji wykonująca zapytania w sposób sekwencyjny
+// Precyzyjna funkcja wektoryzacji pokazująca dokładne błędy Hugging Face
 async function getEmbedding(text) {
   const apiKey = process.env.HF_API_KEY;
-  if (!apiKey) throw new Error("Brak klucza HF_API_KEY w zmiennych środowiskowych.");
+  if (!apiKey) throw new Error("Brak klucza HF_API_KEY w Vercelu. Sprawdź Environment Variables!");
 
-  const endpoints = [
-    "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2",
-    "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
-  ];
+  const url = "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2";
 
-  for (const url of endpoints) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const response = await fetch(url, {
-          method: "POST",
-          headers: { 
-            "Authorization": `Bearer ${apiKey}`, 
-            "Content-Type": "application/json",
-            "User-Agent": "AxonAI-App/1.0",
-            "x-wait-for-model": "true" 
-          },
-          body: JSON.stringify({ inputs: text, options: { wait_for_model: true } }),
-          cache: "no-store"
-        });
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { 
+        "Authorization": `Bearer ${apiKey}`, 
+        "Content-Type": "application/json",
+        "x-wait-for-model": "true" 
+      },
+      body: JSON.stringify({ inputs: text, options: { wait_for_model: true } }),
+      cache: "no-store"
+    });
 
-        if (response.ok) {
-          const result = await response.json();
-          if (Array.isArray(result) && Array.isArray(result[0])) return result[0];
-          if (Array.isArray(result) && typeof result[0] === 'number') return result;
-        }
-      } catch (err) {
-        console.warn(`Nieudana próba wektoryzacji (${url}):`, err.message);
-      }
-      // Krótka pauza przed ewentualną ponowną próbą
-      await new Promise((res) => setTimeout(res, 300));
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`HTTP ${response.status}: ${errText}`);
     }
-  }
 
-  return null;
+    const result = await response.json();
+    if (Array.isArray(result) && Array.isArray(result[0])) return result[0];
+    if (Array.isArray(result) && typeof result[0] === 'number') return result;
+
+    throw new Error(`Błędny format wektora z HF: ${JSON.stringify(result).slice(0, 100)}`);
+  } catch (err) {
+    throw new Error(`Błąd wektoryzacji HF: ${err.message}`);
+  }
 }
 
 export async function POST(req) {
@@ -182,35 +175,30 @@ Podziel skomplikowane tabele na czytelne fragmenty dla inżyniera.`;
 
     if (!Array.isArray(chunks)) chunks = [chunks];
 
-    // SEKWENCYJNA WEKTORYZACJA (zabezpiecza przed odrzuceniem połączenia)
+    // SEKWENCYJNA WEKTORYZACJA
     const records = [];
     for (const chunk of chunks) {
       if (!chunk.title || !chunk.content) continue;
       
       const embedding = await getEmbedding(`${chunk.title}: ${chunk.content}`);
-      if (embedding) {
-        records.push({
-          title: chunk.title,
-          content: chunk.content,
-          embedding,
-          image_url: fileUrl
-        });
-      }
+      records.push({
+        title: chunk.title,
+        content: chunk.content,
+        embedding,
+        image_url: fileUrl
+      });
       
-      // Odstęp czasowy chroniący przed przeciążeniem API
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      await new Promise((res) => setTimeout(res, 200));
     }
 
     if (records.length > 0) {
       const { error: dbError } = await supabase.from('memories').insert(records);
       if (dbError) throw dbError;
-    } else if (chunks.length > 0) {
-      throw new Error("Nie udało się wygenerować wektorów w Hugging Face. Spróbuj ponownie.");
     }
 
     return NextResponse.json({
       success: true,
-      message: `Przeanalizowano dokument i zapisano ${records.length} fragmentów w bazie wiedzy!`
+      message: `Przeanalizowano plik i dodano ${records.length} wpisów do bazy wiedzy!`
     });
 
   } catch (error) {
