@@ -93,7 +93,7 @@ export default function AxonAI() {
       {/* Header */}
       <header className="bg-white border-b-4 border-yellow-400 p-6 text-center shadow-sm">
         <h1 className="text-2xl font-black uppercase tracking-widest text-gray-900">
-          Axon Vision AI
+          Robocop
         </h1>
         <p className="text-sm text-gray-500 mt-1">
           Połączono z silnikiem Gemini. Prześlij zdjęcie tabliczki lub opisz
