@@ -19,7 +19,6 @@ export default function AxonAI() {
 
   const messagesEndRef = useRef(null);
 
-  // KROK 1: Ładowanie historii z LocalStorage przy uruchomieniu aplikacji
   useEffect(() => {
     setIsClient(true);
     const savedChat = localStorage.getItem('axon_chat_history');
@@ -27,7 +26,6 @@ export default function AxonAI() {
       try {
         setMessages(JSON.parse(savedChat));
       } catch (e) {
-        console.error('Błąd ładowania historii:', e);
         setMessages([defaultMessage]);
       }
     } else {
@@ -35,16 +33,13 @@ export default function AxonAI() {
     }
   }, []);
 
-  // KROK 2: Zapisywanie do LocalStorage przy KAŻDEJ nowej wiadomości
   useEffect(() => {
     if (isClient && messages.length > 0) {
-      // Nie zapisujemy komunikatów systemowych typu "Szukam w bazie..."
       const historyToSave = messages.filter(m => m.role !== 'sys');
       localStorage.setItem('axon_chat_history', JSON.stringify(historyToSave));
     }
   }, [messages, isClient]);
 
-  // Funkcja czyszcząca historię
   const handleClearHistory = () => {
     if (window.confirm('Czy na pewno chcesz wyczyścić historię czatu?')) {
       setMessages([defaultMessage]);
@@ -83,20 +78,55 @@ export default function AxonAI() {
     const currentInput = input;
     const currentImage = image;
 
-    setMessages((prev) => [...prev, { role: 'user', text: currentInput, image: currentImage?.name }]);
+    let base64Image = null;
+    let mimeType = null;
+
+    // KROK KLUCZOWY: Konwersja obrazu na format czytelny dla API (Base64)
+    if (currentImage) {
+      const fullBase64 = await new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.readAsDataURL(currentImage);
+      });
+      base64Image = fullBase64.split(',')[1];
+      mimeType = currentImage.type;
+    }
+
+    // Zapisujemy w stanie, aby bot pamiętał zdjęcie w historii rozmowy
+    const userMsgForState = {
+      role: 'user',
+      text: currentInput,
+      image: currentImage?.name,
+      base64Image,
+      mimeType
+    };
+
+    setMessages((prev) => [...prev, userMsgForState]);
     setInput('');
     setImage(null);
     setLoading(true);
 
     setMessages((prev) => [
       ...prev,
-      { role: 'sys', text: currentImage ? 'Analizuję obraz i szukam w bazie wiedzy...' : 'Szukam w bazie wiedzy i generuję odpowiedź...' },
+      { role: 'sys', text: currentImage ? 'Analizuję obraz wizyjnie i szukam w bazie...' : 'Szukam w bazie wiedzy...' },
     ]);
 
     try {
+      // Przygotowanie historii rozmowy (wraz ze zdjęciami) dla API Google
       const historyForApi = messages
         .filter((m) => m.role === 'user' || m.role === 'ai')
-        .map((m) => ({ role: m.role === 'user' ? 'user' : 'assistant', content: m.text }));
+        .map((m) => {
+          const apiMsg = { role: m.role === 'user' ? 'user' : 'assistant', content: m.text };
+          if (m.base64Image) {
+            apiMsg.inlineData = { data: m.base64Image, mimeType: m.mimeType };
+          }
+          return apiMsg;
+        });
+
+      const newApiMsg = { role: 'user', content: currentInput };
+      if (base64Image) {
+        newApiMsg.inlineData = { data: base64Image, mimeType };
+      }
 
       const res = await fetch('/api/chat', {
         method: 'POST',
@@ -104,7 +134,7 @@ export default function AxonAI() {
         body: JSON.stringify({
           prompt: currentInput,
           message: currentInput,
-          messages: [...historyForApi, { role: 'user', content: currentInput }],
+          messages: [...historyForApi, newApiMsg],
         }),
       });
 
@@ -125,7 +155,6 @@ export default function AxonAI() {
     }
   };
 
-  // Renderowanie tylko po załadowaniu klienta (zapobiega błędom Hydration w Next.js)
   if (!isClient) return <div className="h-screen bg-gray-100 flex items-center justify-center">Ładowanie systemu...</div>;
 
   return (
@@ -134,9 +163,8 @@ export default function AxonAI() {
         <h1 className="text-2xl font-black uppercase tracking-widest text-gray-900 flex items-center justify-center gap-2">
           <Bot className="text-yellow-500" size={28} /> Robocop Axon AI
         </h1>
-        <p className="text-xs text-gray-500 mt-1 font-medium">Wyszukiwanie schematów | Ctrl+V | Markdown</p>
+        <p className="text-xs text-gray-500 mt-1 font-medium">Wyszukiwanie schematów | Analiza Obrazu | Markdown</p>
         
-        {/* PRZYCISK CZYSZCZENIA HISTORII */}
         <button 
           onClick={handleClearHistory}
           className="absolute right-4 top-1/2 -translate-y-1/2 flex items-center gap-1 px-3 py-1.5 bg-red-50 text-red-600 hover:bg-red-100 hover:text-red-700 font-bold text-xs rounded-md transition-colors border border-red-200"
@@ -159,7 +187,7 @@ export default function AxonAI() {
               >
                 {msg.image && (
                   <div className="mb-3 text-xs opacity-80 flex items-center gap-1 font-mono bg-black/20 p-2 rounded w-fit">
-                    <Camera size={14} /> Załącznik: {msg.image}
+                    <Camera size={14} /> Załącznik: {msg.image} (Wysłano do wizji)
                   </div>
                 )}
                 
@@ -218,7 +246,7 @@ export default function AxonAI() {
 
         {image && (
           <div className="max-w-4xl mx-auto text-xs text-green-700 font-bold mt-2 flex items-center justify-between bg-green-50 p-2 rounded border border-green-200">
-            <span>📷 Gotowe do analizy: {image.name}</span>
+            <span>📷 Gotowe do wizji AI: {image.name}</span>
             <button onClick={() => setImage(null)} className="text-red-500 hover:underline font-semibold">Usuń</button>
           </div>
         )}

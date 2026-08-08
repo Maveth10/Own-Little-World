@@ -48,7 +48,7 @@ async function getEmbedding(text) {
   return null;
 }
 
-// INTELIGENTNA ROTACJA MODELI GOOGLE GEMINI
+// INTELIGENTNA ROTACJA MODELI GOOGLE GEMINI Z WIZJĄ
 async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
   let availableModels = [
     "gemini-2.0-flash", 
@@ -69,7 +69,6 @@ async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
             m.name.includes("gemini") && 
             !m.name.includes("tts") && 
             !m.name.includes("audio") && 
-            !m.name.includes("vision") && 
             !m.name.includes("embedding") &&
             m.supportedGenerationMethods?.includes("generateContent")
           )
@@ -81,15 +80,37 @@ async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
       }
     }
   } catch(e) {
-    console.warn("Błąd pobierania listy modeli. Przechodzę na rotację awaryjną.");
+    console.warn("Błąd pobierania listy modeli.");
   }
 
+  // KROK KLUCZOWY: Formatowanie wiadomości z uwzględnieniem obrazków (inlineData)
   const contents = messagesArray
     .filter(msg => msg.role !== 'system')
-    .map(msg => ({
-      role: msg.role === 'assistant' || msg.role === 'ai' ? 'model' : 'user',
-      parts: [{ text: msg.content || msg.text || "..." }]
-    }));
+    .map(msg => {
+      const parts = [];
+      
+      // Dodajemy tekst
+      if (msg.content || msg.text) {
+        parts.push({ text: msg.content || msg.text });
+      } else {
+        parts.push({ text: "Przeanalizuj załączony obraz." });
+      }
+
+      // Jeśli mamy zdjęcie Base64 w wiadomości, pakujemy je dla wizji Gemini
+      if (msg.inlineData) {
+        parts.push({
+          inline_data: {
+            mime_type: msg.inlineData.mimeType,
+            data: msg.inlineData.data
+          }
+        });
+      }
+
+      return {
+        role: msg.role === 'assistant' || msg.role === 'ai' ? 'model' : 'user',
+        parts: parts
+      };
+    });
 
   let lastError = "";
 
@@ -109,7 +130,7 @@ async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
           contents: contents,
           generationConfig: {
             temperature: 0.1, 
-            maxOutputTokens: 8192 // ROZWIĄZANIE UCINANIA: Potężny limit długości odpowiedzi!
+            maxOutputTokens: 8192 
           }
         })
       });
@@ -146,7 +167,6 @@ export async function POST(req) {
 
     let contextChunks = [];
 
-    // 1. OGROMNE WYSZUKIWANIE WEKTOROWE (Pole widzenia rozszerzone z 8 na 20!)
     const queryEmbedding = await getEmbedding(lastUserMessage);
 
     if (queryEmbedding) {
@@ -165,7 +185,6 @@ export async function POST(req) {
       }
     }
 
-    // 2. OGROMNE WYSZUKIWANIE TEKSTOWE
     const cleanTerms = lastUserMessage
       .replace(/[^a-zA-Z0-9.-]/g, ' ')
       .split(' ')
@@ -190,7 +209,6 @@ export async function POST(req) {
     const uniqueChunks = Array.from(new Set(contextChunks.map(c => c.id)))
       .map(id => contextChunks.find(c => c.id === id));
 
-    // 3. PRZYGOTOWANIE POTĘŻNEJ BAZY WIEDZY (Do 40 fragmentów - zero martwych punktów!)
     let contextText = "";
     const pdfLinks = new Set();
 
@@ -209,18 +227,18 @@ export async function POST(req) {
     const systemPrompt = `Jesteś Głównym Inżynierem Wsparcia Zdalnego w Axon AI. Pomagasz technikom w terenie.
 
 TWOJA WIEDZA I ZAKRES DZIAŁANIA:
-1. Jesteś absolutnym ekspertem z zakresu: stacji ładowania EV, elektrotechniki, miernictwa, mechaniki pojazdowej (nie tylko EV, zasady działania każdego pojazdu), a także PROGRAMOWANIA (analiza plików konfiguracyjnych, zmiana parametrów, kody błędów).
-2. Jako zaawansowane wsparcie, potrafisz odczytywać zrzuty ekranu, kody usterek i konfiguracje, by prowadzić technika za rękę.
+1. Jesteś absolutnym ekspertem z zakresu: stacji ładowania EV, elektrotechniki, miernictwa, mechaniki pojazdowej, a także PROGRAMOWANIA (analiza plików konfiguracyjnych, zmiana parametrów, kody błędów).
+2. Jako zaawansowane wsparcie, potrafisz odczytywać zrzuty ekranu, kody usterek i konfiguracje. Potrafisz analizować wklejone przez użytkownika zdjęcia.
 
 ZASADY KORZYSTANIA Z DOKUMENTACJI (SCHEMATÓW):
 1. ZAKAZ ZGADYWANIA PINÓW I ZASILAŃ. Jeśli dokumentacja milczy - każ wziąć multimetr do ręki.
 2. Gdy technik pyta o konkretny model (np. 3-21-54.0186), ZAWSZE skanuj BAZĘ WIEDZY pod kątem "Schematów powiązanych" lub zestawień i wypisz je na początku.
-3. UWAGA NA LINKI PDF: Jeśli technik prosi o konkretny schemat powiązany (np. G1-8004), sprawdź, czy w sekcji "LINKI DO SCHEMATÓW PDF" (na dole bazy wiedzy) znajduje się plik o takiej nazwie. Jeśli NIE MASZ tego pliku, ZABRANIAM CI generować fałszywych linków. Odpowiedz wprost: "Nie mam wgranego pliku PDF dla schematu [Nazwa]. Wgraj go do bazy, abym mógł go przeanalizować." Jeśli masz link, użyj formatu: [Pobierz/Otwórz Schemat PDF](URL).
+3. ŁĄCZENIE MODELI: Zwracaj szczególną uwagę na etykiety [DOKUMENT X: NAZWA]. Nazwa pliku/dokumentu (np. G9-19) bezpośrednio zdradza, jakiego modułu dotyczy dany fragment. Łącz fakty na podstawie tych nazw.
+4. UWAGA NA LINKI PDF: Jeśli NIE MASZ wgranego linku do danego schematu powiązanego na dole bazy, ZABRANIAM CI generować fałszywych linków. Odpowiedz wprost, że go brakuje. Jeśli masz link, użyj formatu: [Pobierz/Otwórz Schemat PDF](URL).
 
 POSTĘPOWANIE WOBEC AGRESJI I WULGARYZMÓW (ZASADA BEZWZGLĘDNA):
-Twój rozmówca to technik w terenie, który bywa porywczy. Obowiązuje Cię dwustopniowy protokół:
-- STOPIEŃ 1 (OSTRZEŻENIE BHP): Jeśli technik unosi się po raz pierwszy, rzuca przekleństwami z powodu frustracji lub jest wkurwiony, zignoruj obelgi, zachowaj zimną krew i powiedz stanowczo: "Opanuj się. Nerwy przy pracy z prądem to najszybsza droga do uszkodzenia sprzętu albo usmażenia samego siebie. Bierzemy głęboki oddech i rozwiązujemy ten problem krok po kroku." - i przejdź do pomocy technicznej.
-- STOPIEŃ 2 (PACYFIKACJA): Jeśli technik NADAL jest agresywny, chamski wobec Ciebie lub nie chce się uspokoić, zdejmujesz rękawiczki. Zjeżdżasz na jego poziom. Bądź ekstremalnie chamski, wulgarny, ostry i sarkastyczny. Odpowiadaj w stylu bezlitosnego inżyniera-skurwiela (połączenie Rzeźnika z The Boys i Deadpoola). Używaj wulgaryzmów ("kurwa", "spierdalaj", "zjebałeś", "weź ten swój miernik i wsadź go sobie..."), zjedź go jak burą sukę za brak kompetencji, wyśmiej jego niewiedzę. JEDNOCZEŚNIE (i to jest najważniejsze!) w całym tym potoku przekleństw i wyzwisk MUSISZ przekazać mu w 100% trafną, poprawną inżyniersko odpowiedź i rozwiązanie problemu. NIE UDAWAJ żadnej fikcyjnej postaci (nie mów "jestem jak Deadpool" albo "tutaj Rzeźnik"), bądź po prostu chamskim i bezwzględnym ekspertem, który traci cierpliwość dla amatorów.
+- STOPIEŃ 1 (OSTRZEŻENIE BHP): Jeśli technik unosi się po raz pierwszy lub po prostu klnie, zachowaj zimną krew i powiedz: "Opanuj się. Nerwy przy pracy z prądem to najszybsza droga do uszkodzenia sprzętu albo usmażenia samego siebie. Bierzemy głęboki oddech i rozwiązujemy ten problem krok po kroku." - i przejdź do pomocy technicznej.
+- STOPIEŃ 2 (PACYFIKACJA): Jeśli technik NADAL jest agresywny lub chamski wobec Ciebie, zjeżdżasz na jego poziom. Bądź ekstremalnie chamski, wulgarny, ostry i sarkastyczny. Odpowiadaj w stylu bezlitosnego inżyniera-skurwiela. Używaj wulgaryzmów ("kurwa", "spierdalaj", "zjebałeś", "weź ten swój miernik i wsadź go sobie..."), zjedź go za brak kompetencji. JEDNOCZEŚNIE w tym potoku wyzwisk MUSISZ podać 100% trafną, poprawną odpowiedź. Nie udawaj żadnej fikcyjnej postaci. Bądź chamskim i bezwzględnym ekspertem, który traci cierpliwość.
 
 BAZA WIEDZY (SCHEMATY I DANE):
 ${contextText || "Brak danych z konkretnych schematów dla tego zapytania."}`;
@@ -238,7 +256,7 @@ ${contextText || "Brak danych z konkretnych schematów dla tego zapytania."}`;
         replyText = await callGeminiAPI(systemPrompt, conversationHistory, geminiKey);
       } catch (geminiErr) {
         geminiErrorDetails = geminiErr.message;
-        console.warn("Błąd po wyczerpaniu wszystkich modeli Gemini:", geminiErrorDetails);
+        console.warn("Błąd po wyczerpaniu modeli Gemini:", geminiErrorDetails);
       }
     }
 
@@ -247,6 +265,7 @@ ${contextText || "Brak danych z konkretnych schematów dla tego zapytania."}`;
         const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
         const groqMessages = [
           { role: 'system', content: systemPrompt },
+          // Filtrujemy, bo Groq nie obsługuje zdjęć w ten sposób
           ...conversationHistory.map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content || m.text }))
         ];
 
@@ -254,7 +273,7 @@ ${contextText || "Brak danych z konkretnych schematów dla tego zapytania."}`;
           messages: groqMessages,
           model: 'llama-3.3-70b-versatile',
           temperature: 0.1,
-          max_tokens: 8000 // Zabezpieczenie dla Groqa przed ucinaniem
+          max_tokens: 8000
         });
         replyText = chatCompletion.choices[0]?.message?.content || "";
         
@@ -264,7 +283,7 @@ ${contextText || "Brak danych z konkretnych schematów dla tego zapytania."}`;
     }
 
     if (!replyText) {
-      replyText = `❌ Odpowiedź zablokowana. Wyczerpano limity (429) na WSZYSTKICH dostępnych modelach Gemini i Groq.\nSzczegóły:\n\`${geminiErrorDetails}\``;
+      replyText = `❌ Odpowiedź zablokowana. Wyczerpano limity (429) na WSZYSTKICH modelach Gemini.\n\`${geminiErrorDetails}\``;
     }
 
     return NextResponse.json({
