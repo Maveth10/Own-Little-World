@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { Send, Upload, Camera, Bot, User } from 'lucide-react';
+import { Send, Upload, Camera, Bot } from 'lucide-react';
 
 export default function AxonAI() {
   const [messages, setMessages] = useState([
@@ -13,6 +13,46 @@ export default function AxonAI() {
   const [input, setInput] = useState('');
   const [image, setImage] = useState(null);
   const [loading, setLoading] = useState(false);
+
+  // Funkcja zamieniająca kod Markdown [Tytuł](URL) na czysty, klikalny przycisk
+  const renderFormattedText = (text) => {
+    if (!text) return null;
+
+    const markdownLinkRegex = /\[(.*?)\]\((https?:\/\/[^\s)]+)\)/g;
+    const parts = [];
+    let lastIndex = 0;
+    let match;
+
+    while ((match = markdownLinkRegex.exec(text)) !== null) {
+      if (match.index > lastIndex) {
+        parts.push(text.substring(lastIndex, match.index));
+      }
+
+      const linkTitle = match[1] || 'Otwórz Schemat PDF';
+      const linkUrl = match[2];
+
+      parts.push(
+        <span key={match.index} className="block my-2">
+          <a
+            href={linkUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-2 px-4 py-2 bg-yellow-400 hover:bg-yellow-500 text-black font-bold text-xs md:text-sm rounded-lg shadow-sm transition-colors border border-yellow-500 cursor-pointer no-underline"
+          >
+            📄 {linkTitle}
+          </a>
+        </span>
+      );
+
+      lastIndex = markdownLinkRegex.lastIndex;
+    }
+
+    if (lastIndex < text.length) {
+      parts.push(text.substring(lastIndex));
+    }
+
+    return parts.length > 0 ? parts : text;
+  };
 
   const handleImageUpload = (e) => {
     const file = e.target.files ? e.target.files[0] : null;
@@ -27,7 +67,6 @@ export default function AxonAI() {
     const currentInput = input;
     const currentImage = image;
 
-    // Dodanie wiadomości użytkownika do interfejsu
     const userMsg = {
       role: 'user',
       text: currentInput,
@@ -39,7 +78,6 @@ export default function AxonAI() {
     setImage(null);
     setLoading(true);
 
-    // Dodanie komunikatu o przetwarzaniu
     setMessages((prev) => [
       ...prev,
       {
@@ -49,7 +87,6 @@ export default function AxonAI() {
     ]);
 
     try {
-      // Przygotowanie historii wiadomości w formacie akceptowanym przez API
       const historyForApi = messages
         .filter((m) => m.role === 'user' || m.role === 'ai')
         .map((m) => ({
@@ -57,7 +94,6 @@ export default function AxonAI() {
           content: m.text,
         }));
 
-      // Wysłanie zapytania JSON do app/api/chat/route.js
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: {
@@ -71,8 +107,6 @@ export default function AxonAI() {
       });
 
       const data = await res.json();
-
-      // Wyciągnięcie odpowiedzi z dowolnego pola zwracanego przez backend
       const replyText = data.content || data.reply || data.text || data.message || data.error;
 
       setMessages((prev) => {
@@ -137,7 +171,10 @@ export default function AxonAI() {
                     <Camera size={14} /> Załącznik: {msg.image}
                   </div>
                 )}
-                <div className="whitespace-pre-wrap break-words">{msg.text}</div>
+                {/* PARSER TEKSTU Z OBSŁUGĄ KLIKALNYCH LINKÓW */}
+                <div className="whitespace-pre-wrap break-words">
+                  {renderFormattedText(msg.text)}
+                </div>
               </div>
             )}
           </div>
@@ -158,7 +195,6 @@ export default function AxonAI() {
             />
           </label>
 
-          {/* POLE PROMPTA Z WYRAŹNYM CZARNYM TEKSTEM NA BIAŁYM TLE */}
           <input
             type="text"
             value={input}

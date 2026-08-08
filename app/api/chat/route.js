@@ -30,7 +30,7 @@ async function getEmbedding(text) {
         "User-Agent": "AxonAI-App/1.0",
         "x-wait-for-model": "true"
       },
-      body: JSON.stringify({ inputs: text.slice(0, 500), options: { wait_for_model: true } }),
+      body: JSON.stringify({ inputs: text.slice(0, 300), options: { wait_for_model: true } }),
       signal: controller.signal,
       cache: "no-store"
     });
@@ -49,9 +49,41 @@ async function getEmbedding(text) {
   return null;
 }
 
+// Obsługa zapytania do silnika Google Gemini (1 000 000 TPM limitu)
+async function callGeminiAPI(systemPrompt, userQuery) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: `${systemPrompt}\n\nPYTANIE UŻYTKOWNIKA:\n${userQuery}` }]
+        }
+      ],
+      generationConfig: {
+        temperature: 0.1,
+        maxOutputTokens: 2048
+      }
+    })
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Błąd Gemini API (${response.status}): ${errText}`);
+  }
+
+  const data = await response.json();
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || null;
+}
+
 export async function POST(req) {
   try {
-    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
     const supabase = getSupabase();
 
     const body = await req.json();
@@ -65,7 +97,7 @@ export async function POST(req) {
 
     let contextChunks = [];
 
-    // 1. WYSZUKIWANIE WEKTOROWE W ai_memory
+    // 1. WYSZUKIWANIE WEKTOROWE
     const queryEmbedding = await getEmbedding(lastUserMessage);
 
     if (queryEmbedding) {
@@ -73,7 +105,7 @@ export async function POST(req) {
         const { data: vectorData } = await supabase.rpc('match_ai_memory', {
           query_embedding: queryEmbedding,
           match_threshold: 0.01,
-          match_count: 8
+          match_count: 6
         });
 
         if (vectorData && vectorData.length > 0) {
@@ -84,9 +116,8 @@ export async function POST(req) {
       }
     }
 
-    // 2. BEZPIECZNE WYSZUKIWANIE TEKSTOWE
+    // 2. WYSZUKIWANIE TEKSTOWE / PO SYMBOLACH
     if (contextChunks.length === 0) {
-      // Wyciąganie bezpiecznych symboli technicznych (np. 1A8, 3-21-52.0189)
       const cleanTerms = lastUserMessage
         .replace(/[^a-zA-Z0-9.-]/g, ' ')
         .split(' ')
@@ -108,7 +139,6 @@ export async function POST(req) {
         console.warn("Błąd wyszukiwania słów kluczowych:", err.message);
       }
 
-      // Fallback: Zawsze pobierz ostatnie wpisy z ai_memory w przypadku braku dopasowań
       if (contextChunks.length === 0) {
         const { data: recentData } = await supabase
           .from('ai_memory')
@@ -120,52 +150,69 @@ export async function POST(req) {
       }
     }
 
-    // Usuwanie ewentualnych powtórzeń w znalezionych rekordach
     const uniqueChunks = Array.from(new Set(contextChunks.map(c => c.id)))
       .map(id => contextChunks.find(c => c.id === id));
 
-    // 3. PRZYGOTOWANIE TREŚCI DLA MODELU
+    // 3. PRZYGOTOWANIE BAZY WIEDZY
     let contextText = "";
     const pdfLinks = new Set();
 
     uniqueChunks.forEach((chunk, idx) => {
-      contextText += `\n--- DOKUMENTACJA ${idx + 1} (${chunk.title}) ---\n${chunk.content}\n`;
+      contextText += `\n[DOKUMENT ${idx + 1}: ${chunk.title}]\n${chunk.content}\n`;
       if (chunk.image_url) {
         pdfLinks.add(chunk.image_url);
       }
     });
 
     if (pdfLinks.size > 0) {
-      contextText += `\nPLIKI SCHEMATÓW DO TEJ DOKUMENTACJI:\n` + Array.from(pdfLinks).map(url => `- ${url}`).join('\n') + `\n`;
+      contextText += `\nLINKI DO SCHEMATÓW PDF:\n` + Array.from(pdfLinks).map(url => `- ${url}`).join('\n') + `\n`;
     }
 
-    // 4. SYSTEM PROMPT
-    const systemPrompt = `Jesteś Głównym Inżynierem Serwisu Axon AI. 
-Odpowiadaj precyzyjnie, zwięźle i bardzo technicznie na podstawie BAZY WIEDZY.
-Jeżeli w BAZIE WIEDZY znajduje się link URL do pliku PDF, ZAWSZE dołącz go w odpowiedzi w formacie Markdown: [Pobierz/Otwórz Schemat PDF](URL).
+    const systemPrompt = `Jesteś Głównym Inżynierem Serwisu Axon AI.
+Odpowiadaj precyzyjnie, zwięźle i technicznie na podstawie BAZY WIEDZY.
+Jeżeli w BAZIE WIEDZY znajduje się link URL do pliku PDF ze schematem, ZAWSZE umieść go w odpowiedzi w formacie Markdown: [Pobierz/Otwórz Schemat PDF](URL).
 
-BAZA WIEDZY Z TABELI ai_memory:
-${contextText || "Brak szczegółów w bazie."}`;
+BAZA WIEDZY DOKUMENTACJI TECHNICZNEJ:
+${contextText || "Brak danych w bazie."}`;
 
-    const formattedMessages = [
-      { role: 'system', content: systemPrompt },
-      ...messages.filter(m => m.role !== 'system')
-    ];
+    let replyText = "";
 
-    if (messages.length === 0 && lastUserMessage) {
-      formattedMessages.push({ role: 'user', content: lastUserMessage });
+    // 4. STRAŻNIK LIMITÓW: Najpierw próba wywołania Google Gemini (1M TPM)
+    try {
+      replyText = await callGeminiAPI(systemPrompt, lastUserMessage);
+    } catch (geminiErr) {
+      console.warn("Błąd silnika Gemini, przełączanie na Groq:", geminiErr.message);
     }
 
-    // 5. WYWOŁANIE MODELU GROQ
-    const chatCompletion = await groq.chat.completions.create({
-      messages: formattedMessages,
-      model: 'llama-3.3-70b-versatile',
-      temperature: 0.1,
-    });
+    // 5. FALLBACK: Jeśli Gemini nie zwróci wyniku, wywołujemy Groq (Llama 70B -> Llama 8B)
+    if (!replyText) {
+      const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+      const fallbackModels = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant'];
 
-    const replyText = chatCompletion.choices[0]?.message?.content || "Brak odpowiedzi od AI.";
+      const formattedMessages = [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: lastUserMessage }
+      ];
 
-    // Uniwersalna struktura danych JSON pasująca do każdego interfejsu
+      for (const modelName of fallbackModels) {
+        try {
+          const chatCompletion = await groq.chat.completions.create({
+            messages: formattedMessages,
+            model: modelName,
+            temperature: 0.1,
+          });
+          replyText = chatCompletion.choices[0]?.message?.content || "";
+          if (replyText) break;
+        } catch (groqErr) {
+          console.warn(`Groq (${modelName}) limit:`, groqErr.message);
+        }
+      }
+    }
+
+    if (!replyText) {
+      replyText = "Nie udało się pobrać odpowiedzi. Spróbuj ponownie za chwilę.";
+    }
+
     return NextResponse.json({
       role: 'assistant',
       content: replyText,
@@ -176,7 +223,7 @@ ${contextText || "Brak szczegółów w bazie."}`;
 
   } catch (error) {
     console.error("Błąd w trakcie czatu:", error);
-    return NextResponse.json({ 
+    return NextResponse.json({
       error: error.message,
       content: `Błąd serwera: ${error.message}`,
       reply: `Błąd serwera: ${error.message}`
