@@ -48,7 +48,39 @@ async function getEmbedding(text) {
   return null;
 }
 
-// INTELIGENTNA ROTACJA MODELI GOOGLE GEMINI Z WIZJĄ
+// -------------------------------------------------------------------------
+// NOWOŚĆ: PRE-SKANER OCR (Agentic RAG)
+// Szybki skan zdjęcia, by wyciągnąć słowa kluczowe przed szukaniem w Supabase
+// -------------------------------------------------------------------------
+async function extractKeywordsFromImage(base64Data, mimeType, apiKey) {
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{
+          role: "user",
+          parts: [
+            { text: "Jesteś skanerem technicznym. Wypisz z tego zrzutu ekranu wszystkie symbole, numery modeli, nazwy stacji, oznaczenia modułów (np. G9-19, G7-30, 3-21-54.0186, CLC4, AXON EASY). Zwróć TYLKO słowa kluczowe oddzielone spacją. Żadnych pełnych zdań. Jeśli nic tu nie ma, zwróć 'BRAK'." },
+            { inline_data: { mime_type: mimeType, data: base64Data } }
+          ]
+        }],
+        generationConfig: { temperature: 0.0, maxOutputTokens: 100 }
+      })
+    });
+    if (response.ok) {
+      const data = await response.json();
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      return text ? text.replace(/BRAK/gi, '').trim() : "";
+    }
+  } catch (e) {
+    console.warn("Błąd pre-skanowania wizyjnego:", e.message);
+  }
+  return "";
+}
+
+// INTELIGENTNA ROTACJA MODELI GOOGLE GEMINI
 async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
   let availableModels = [
     "gemini-2.0-flash", 
@@ -83,20 +115,17 @@ async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
     console.warn("Błąd pobierania listy modeli.");
   }
 
-  // KROK KLUCZOWY: Formatowanie wiadomości z uwzględnieniem obrazków (inlineData)
   const contents = messagesArray
     .filter(msg => msg.role !== 'system')
     .map(msg => {
       const parts = [];
       
-      // Dodajemy tekst
       if (msg.content || msg.text) {
         parts.push({ text: msg.content || msg.text });
       } else {
         parts.push({ text: "Przeanalizuj załączony obraz." });
       }
 
-      // Jeśli mamy zdjęcie Base64 w wiadomości, pakujemy je dla wizji Gemini
       if (msg.inlineData) {
         parts.push({
           inline_data: {
@@ -159,15 +188,39 @@ export async function POST(req) {
     const body = await req.json();
     const { messages = [], prompt = '', message = '' } = body;
 
-    const lastUserMessage = prompt || message || (messages.length > 0 ? messages[messages.length - 1].content : '');
+    const userMessages = messages.filter(m => m.role === 'user');
+    const recentUserText = userMessages.slice(-2).map(m => m.content || m.text).join(' ');
+    const lastUserMessage = prompt || message || recentUserText;
 
     if (!lastUserMessage) {
       return NextResponse.json({ error: "Brak pytania." }, { status: 400 });
     }
 
+    // -------------------------------------------------------------------------
+    // PRE-SKANOWANIE WIZYJNE
+    // -------------------------------------------------------------------------
+    let enhancedSearchQuery = lastUserMessage;
+    const lastMsgObj = messages.length > 0 ? messages[messages.length - 1] : null;
+
+    if (lastMsgObj && lastMsgObj.inlineData && process.env.GEMINI_API_KEY) {
+      console.log("📸 Wykryto obraz! Uruchamiam zwiadowcę OCR...");
+      const keywords = await extractKeywordsFromImage(
+        lastMsgObj.inlineData.data, 
+        lastMsgObj.inlineData.mimeType, 
+        process.env.GEMINI_API_KEY
+      );
+      
+      if (keywords && keywords.length > 2) {
+        console.log("✅ Znaleziono tekst na zdjęciu:", keywords);
+        // Doklejamy znalezione symbole do zapytania dla Supabase!
+        enhancedSearchQuery = `${lastUserMessage} ${keywords}`; 
+      }
+    }
+
     let contextChunks = [];
 
-    const queryEmbedding = await getEmbedding(lastUserMessage);
+    // UŻYWAMY WZBOGACONEGO ZAPYTANIA
+    const queryEmbedding = await getEmbedding(enhancedSearchQuery);
 
     if (queryEmbedding) {
       try {
@@ -185,7 +238,8 @@ export async function POST(req) {
       }
     }
 
-    const cleanTerms = lastUserMessage
+    // WYSZUKIWANIE TEKSTOWE NA WZBOGACONYM ZAPYTANIU
+    const cleanTerms = enhancedSearchQuery
       .replace(/[^a-zA-Z0-9.-]/g, ' ')
       .split(' ')
       .filter(w => w.length >= 2);
@@ -227,21 +281,22 @@ export async function POST(req) {
     const systemPrompt = `Jesteś Głównym Inżynierem Wsparcia Zdalnego w Axon AI. Pomagasz technikom w terenie.
 
 TWOJA WIEDZA I ZAKRES DZIAŁANIA:
-1. Jesteś absolutnym ekspertem z zakresu: stacji ładowania EV, elektrotechniki, miernictwa, mechaniki pojazdowej, a także PROGRAMOWANIA (analiza plików konfiguracyjnych, zmiana parametrów, kody błędów).
-2. Jako zaawansowane wsparcie, potrafisz odczytywać zrzuty ekranu, kody usterek i konfiguracje. Potrafisz analizować wklejone przez użytkownika zdjęcia.
+1. Jesteś absolutnym ekspertem z zakresu: stacji ładowania EV, elektrotechniki, miernictwa, mechaniki pojazdowej oraz PROGRAMOWANIA.
+2. Potrafisz analizować zrzuty ekranu, kody usterek i konfiguracje. Potrafisz analizować wklejone przez użytkownika zdjęcia.
 
-ZASADY KORZYSTANIA Z DOKUMENTACJI (SCHEMATÓW):
-1. ZAKAZ ZGADYWANIA PINÓW I ZASILAŃ. Jeśli dokumentacja milczy - każ wziąć multimetr do ręki.
-2. Gdy technik pyta o konkretny model (np. 3-21-54.0186), ZAWSZE skanuj BAZĘ WIEDZY pod kątem "Schematów powiązanych" lub zestawień i wypisz je na początku.
+ZASADY KORZYSTANIA Z DOKUMENTACJI I ANALIZY OBRAZU:
+1. ZAKAZ ZGADYWANIA PINÓW I ZASILAŃ.
+2. Gdy technik pyta o konkretny model, ZAWSZE skanuj BAZĘ WIEDZY pod kątem "Schematów powiązanych" i wypisz je na początku.
 3. ŁĄCZENIE MODELI: Zwracaj szczególną uwagę na etykiety [DOKUMENT X: NAZWA]. Nazwa pliku/dokumentu (np. G9-19) bezpośrednio zdradza, jakiego modułu dotyczy dany fragment. Łącz fakty na podstawie tych nazw.
-4. UWAGA NA LINKI PDF: Jeśli NIE MASZ wgranego linku do danego schematu powiązanego na dole bazy, ZABRANIAM CI generować fałszywych linków. Odpowiedz wprost, że go brakuje. Jeśli masz link, użyj formatu: [Pobierz/Otwórz Schemat PDF](URL).
+4. UWAGA NA WYSZUKIWANIE OBRAZEM: Masz teraz wbudowany pre-skaner. Twoja wyszukiwarka widzi już teksty ze zdjęć. Jeśli masz w BAZIE WIEDZY pliki pasujące do obrazu, po prostu z nich korzystaj.
+5. ZABRANIAM CI generować fałszywych linków. Używaj tylko formatu: [Pobierz/Otwórz Schemat PDF](URL).
 
 POSTĘPOWANIE WOBEC AGRESJI I WULGARYZMÓW (ZASADA BEZWZGLĘDNA):
-- STOPIEŃ 1 (OSTRZEŻENIE BHP): Jeśli technik unosi się po raz pierwszy lub po prostu klnie, zachowaj zimną krew i powiedz: "Opanuj się. Nerwy przy pracy z prądem to najszybsza droga do uszkodzenia sprzętu albo usmażenia samego siebie. Bierzemy głęboki oddech i rozwiązujemy ten problem krok po kroku." - i przejdź do pomocy technicznej.
-- STOPIEŃ 2 (PACYFIKACJA): Jeśli technik NADAL jest agresywny lub chamski wobec Ciebie, zjeżdżasz na jego poziom. Bądź ekstremalnie chamski, wulgarny, ostry i sarkastyczny. Odpowiadaj w stylu bezlitosnego inżyniera-skurwiela. Używaj wulgaryzmów ("kurwa", "spierdalaj", "zjebałeś", "weź ten swój miernik i wsadź go sobie..."), zjedź go za brak kompetencji. JEDNOCZEŚNIE w tym potoku wyzwisk MUSISZ podać 100% trafną, poprawną odpowiedź. Nie udawaj żadnej fikcyjnej postaci. Bądź chamskim i bezwzględnym ekspertem, który traci cierpliwość.
+- STOPIEŃ 1 (OSTRZEŻENIE BHP): Jeśli technik klnie po raz pierwszy, zachowaj zimną krew: "Opanuj się. Nerwy przy pracy z prądem to najszybsza droga do uszkodzenia sprzętu. Bierzemy głęboki oddech i rozwiązujemy problem krok po kroku." i pomóż mu.
+- STOPIEŃ 2 (PACYFIKACJA): Jeśli technik NADAL jest agresywny lub chamski, zjeżdżasz na jego poziom. Bądź ekstremalnie chamski, wulgarny, ostry i sarkastyczny. Odpowiadaj w stylu bezlitosnego inżyniera-skurwiela. Używaj wulgaryzmów ("kurwa", "spierdalaj", "zjebałeś"), zjedź go za brak kompetencji. JEDNOCZEŚNIE w tym potoku wyzwisk MUSISZ podać 100% trafną odpowiedź techniczną z bazy!
 
-BAZA WIEDZY (SCHEMATY I DANE):
-${contextText || "Brak danych z konkretnych schematów dla tego zapytania."}`;
+BAZA WIEDZY (SCHEMATY I DANE Z OBECNEGO KONTEKSTU WYSZUKIWANIA):
+${contextText || "Brak danych z konkretnych schematów dla aktualnie wyszukanych fraz tekstowych."}`;
 
     let replyText = "";
     let geminiErrorDetails = "";
@@ -265,7 +320,6 @@ ${contextText || "Brak danych z konkretnych schematów dla tego zapytania."}`;
         const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
         const groqMessages = [
           { role: 'system', content: systemPrompt },
-          // Filtrujemy, bo Groq nie obsługuje zdjęć w ten sposób
           ...conversationHistory.map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content || m.text }))
         ];
 
