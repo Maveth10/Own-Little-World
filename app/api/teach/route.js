@@ -12,24 +12,41 @@ function getSupabase() {
   return createClient(url, key);
 }
 
+// Odporna funkcja wektoryzacji z podwójnym endpointem i próbami ponowienia
 async function getEmbedding(text) {
   const apiKey = process.env.HF_API_KEY;
   if (!apiKey) throw new Error("Brak klucza HF_API_KEY");
 
-  const response = await fetch(
-    "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2",
-    {
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", "x-wait-for-model": "true" },
-      method: "POST",
-      body: JSON.stringify({ inputs: text, options: { wait_for_model: true } }),
-    }
-  );
+  const endpoints = [
+    "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2",
+    "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
+  ];
 
-  if (!response.ok) throw new Error(`Błąd HF API: ${response.status}`);
-  const result = await response.json();
-  if (Array.isArray(result) && Array.isArray(result[0])) return result[0];
-  if (Array.isArray(result)) return result;
-  throw new Error("Nieprawidłowy format wektora");
+  for (const url of endpoints) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const response = await fetch(url, {
+          headers: { 
+            Authorization: `Bearer ${apiKey}`, 
+            "Content-Type": "application/json",
+            "x-wait-for-model": "true" 
+          },
+          method: "POST",
+          body: JSON.stringify({ inputs: text, options: { wait_for_model: true } }),
+        });
+
+        if (response.ok) {
+          const result = await response.json();
+          if (Array.isArray(result) && Array.isArray(result[0])) return result[0];
+          if (Array.isArray(result)) return result;
+        }
+      } catch (err) {
+        console.warn(`Próba połączenia z ${url} (próba ${attempt + 1}) nie powiodła się:`, err.message);
+      }
+    }
+  }
+
+  throw new Error("Błąd Hugging Face: Serwer wektoryzacji nie odpowiada po kilku próbach.");
 }
 
 export async function POST(req) {
@@ -161,7 +178,7 @@ Podziel skomplikowane tabele na czytelne fragmenty dla inżyniera.`;
 
     if (!Array.isArray(chunks)) chunks = [chunks];
 
-    // RÓWNOLEGŁA WEKTORYZACJA (Radykalne przyspieszenie działania)
+    // RÓWNOLEGŁA WEKTORYZACJA
     const recordPromises = chunks.map(async (chunk) => {
       if (!chunk.title || !chunk.content) return null;
       try {
@@ -176,6 +193,10 @@ Podziel skomplikowane tabele na czytelne fragmenty dla inżyniera.`;
     });
 
     const records = (await Promise.all(recordPromises)).filter(Boolean);
+
+    if (chunks.length > 0 && records.length === 0) {
+      throw new Error("Usługa Hugging Face nie zgenerowała wektorów. Spróbuj ponownie za chwilę.");
+    }
 
     if (records.length > 0) {
       const { error: dbError } = await supabase.from('memories').insert(records);

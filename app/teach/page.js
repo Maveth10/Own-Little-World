@@ -14,7 +14,7 @@ function getSupabase() {
 export default function TeachAI() {
   const [title, setTitle] = useState('');
   const [content, setContent] = useState('');
-  const [file, setFile] = useState<File | null>(null);
+  const [file, setFile] = useState(null);
   const [status, setStatus] = useState('');
 
   const handleSave = async () => {
@@ -35,7 +35,6 @@ export default function TeachAI() {
         fileName = `${Date.now()}_${safeName}`;
         fileType = file.type || (file.name.endsWith('.pdf') ? 'application/pdf' : 'image/jpeg');
 
-        // Wysyłka bezpośrednio z przeglądarki do Supabase (Ominięcie limitu 4.5MB Vercela)
         const { error: uploadError } = await supabase.storage
           .from('schematy')
           .upload(fileName, file, { contentType: fileType, upsert: true });
@@ -49,7 +48,6 @@ export default function TeachAI() {
 
       setStatus('⏳ Przetwarzanie dokumentu przez AI (Analiza i wektoryzacja)...');
 
-      // Przesłanie lekkiego ładunku JSON do Vercel API
       const res = await fetch('/api/teach', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -72,7 +70,7 @@ export default function TeachAI() {
       } else {
         setStatus('❌ Błąd API: ' + data.error);
       }
-    } catch (error: any) {
+    } catch (error) {
       console.error(error);
       setStatus('❌ Błąd: ' + (error.message || 'Problem z połączeniem.'));
     }
@@ -109,7 +107,7 @@ export default function TeachAI() {
               type="file"
               accept="image/*,application/pdf"
               className="hidden"
-              onChange={(e) => setFile(e.target.files?.[0] || null)}
+              onChange={(e) => setFile(e.target.files ? e.target.files[0] : null)}
             />
           </label>
           {file && (
