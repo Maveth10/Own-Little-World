@@ -49,11 +49,36 @@ async function getEmbedding(text) {
   return null;
 }
 
-// Integracja z Google Gemini API (Bezpośredni strzał do stabilnej wersji)
+// INTELIGENTNA integracja z Google Gemini - Dynamiczne pobieranie listy modeli z serwera
 async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
-  // Używamy stabilnej wersji 1.5-flash, omijając awaryjny endpoint ListModels
-  const targetModel = "gemini-1.5-flash"; 
+  let targetModel = "gemini-1.5-flash"; // Wartość domyślna w razie problemów z listą
 
+  // KROK 1: Dynamiczne zapytanie do Google o dostępne w tej chwili modele
+  try {
+    const listUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
+    const listRes = await fetch(listUrl, { method: "GET" });
+    
+    if (listRes.ok) {
+      const listData = await listRes.json();
+      if (listData.models && listData.models.length > 0) {
+        // Wyciągamy modele z rodziny Gemini wspierające generowanie treści, preferujemy szybkie modele Flash
+        const validModels = listData.models
+          .filter(m => m.name.includes("gemini") && m.supportedGenerationMethods?.includes("generateContent"))
+          .map(m => m.name.replace("models/", ""));
+          
+        if (validModels.length > 0) {
+          const flashModels = validModels.filter(m => m.includes("flash"));
+          // Jeśli jest lista flash, wybieramy jeden z nich, w przeciwnym razie bierzemy pierwszy działający
+          targetModel = flashModels.length > 0 ? flashModels[flashModels.length - 1] : validModels[0];
+          console.log("Dynamicznie wybrano model Gemini z serwera Google:", targetModel);
+        }
+      }
+    }
+  } catch(e) {
+    console.warn("Błąd podczas pobierania dynamicznej listy modeli Gemini. Używam modelu awaryjnego.");
+  }
+
+  // KROK 2: Przygotowanie formatu dla Google i wykonanie właściwego strzału
   const contents = messagesArray
     .filter(msg => msg.role !== 'system')
     .map(msg => ({
@@ -72,7 +97,7 @@ async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
       },
       contents: contents,
       generationConfig: {
-        temperature: 0.0, // Absolutne 0 - zero kreatywności, tylko fakty
+        temperature: 0.1, 
         maxOutputTokens: 2048
       }
     })
@@ -84,10 +109,10 @@ async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
     if (text) return text;
   } else {
     const errText = await response.text();
-    throw new Error(`Błąd ${response.status}: ${errText}`);
+    throw new Error(`${response.status} na modelu ${targetModel} - ${errText}`);
   }
 
-  throw new Error("Pusta odpowiedź od Gemini.");
+  throw new Error(`Żaden z modeli nie zwrócił poprawnej odpowiedzi. Testowany: ${targetModel}`);
 }
 
 export async function POST(req) {
@@ -113,7 +138,7 @@ export async function POST(req) {
         const { data: vectorData } = await supabase.rpc('match_ai_memory', {
           query_embedding: queryEmbedding,
           match_threshold: 0.01,
-          match_count: 8 // Zwiększono z 5 do 8
+          match_count: 8
         });
 
         if (vectorData && vectorData.length > 0) {
@@ -136,7 +161,7 @@ export async function POST(req) {
           .from('ai_memory')
           .select('*')
           .or(`title.ilike.%${term}%,content.ilike.%${term}%`)
-          .limit(8); // Zwiększono z 4 do 8 dla każdego słowa kluczowego
+          .limit(8);
 
         if (searchResults && searchResults.length > 0) {
           contextChunks.push(...searchResults);
@@ -146,17 +171,15 @@ export async function POST(req) {
       console.warn("Błąd wyszukiwania słów kluczowych:", err.message);
     }
 
-    // Usunięcie duplikatów
     const uniqueChunks = Array.from(new Set(contextChunks.map(c => c.id)))
       .map(id => contextChunks.find(c => c.id === id));
 
-    // 3. PRZYGOTOWANIE BAZY WIEDZY (Potężny zastrzyk kontekstu)
+    // 3. PRZYGOTOWANIE BAZY WIEDZY
     let contextText = "";
     const pdfLinks = new Set();
 
-    // Bierzemy aż do 12 fragmentów, każdy do 2000 znaków (Gemini ma ogromny limit, poradzi sobie z tym bez problemu)
     uniqueChunks.slice(0, 12).forEach((chunk, idx) => {
-      const safeContent = chunk.content.length > 2000 ? chunk.content.substring(0, 2000) + '...' : chunk.content;
+      const safeContent = chunk.content.length > 1500 ? chunk.content.substring(0, 1500) + '...' : chunk.content;
       contextText += `\n[DOKUMENT ${idx + 1}: ${chunk.title}]\n${safeContent}\n`;
       if (chunk.image_url) {
         pdfLinks.add(chunk.image_url);
@@ -167,20 +190,17 @@ export async function POST(req) {
       contextText += `\nLINKI DO SCHEMATÓW PDF:\n` + Array.from(pdfLinks).map(url => `- ${url}`).join('\n') + `\n`;
     }
 
-    // 4. RYGORYSTYCZNY SYSTEM PROMPT
-    const systemPrompt = `Jesteś Głównym Inżynierem Wsparcia Zdalnego (Remote Support Senior Engineer) w Axon AI. Pomagasz technikom pracującym w terenie.
+    // 4. RYGORYSTYCZNY PROMPT INŻYNIERSKI
+    const systemPrompt = `Jesteś Głównym Inżynierem Wsparcia Zdalnego w Axon AI. Pomagasz technikom w terenie.
 
-    TWOJA WIEDZA I ROLA:
-    1. Masz potężną wiedzę z zakresu elektrotechniki, automatyki, miernictwa, wszelkiego programowania, bezpieczeństwa (BHP) i stacji ładowania EV oraz pojazdow EV. 
-    2. Zachowuj się jak starszy kolega z serwisu. Tłumacz pojęcia (np. SLAC, PLC, różnicówki), doradzaj jak wykonać pomiary multimetrem, ostrzegaj przed zagrożeniami (np. co się stanie przy zwarciu) i podpowiadaj logiczne kroki diagnostyczne.
-    
-    ZASADY KORZYSTANIA Z BAZY WIEDZY (SCHEMATÓW):
-    1. Gdy technik pyta o KONKRETNE przypisanie pinów, numery części, bezpieczniki lub sposób okablowania dla danego modelu – używaj WYŁĄCZNIE informacji z poniższej BAZY WIEDZY.
-    2. ZAKAZ ZGADYWANIA PINÓW I ZASILAŃ. Jeśli na schemacie nie jest napisane, że moduł ma zasilanie 24VDC, nie zakładaj tego z góry. Powiedz: "Według dokumentacji nie mam podanego napięcia zasilania dla tego pinu, zmierz to ostrożnie multimetrem lub sprawdź tabliczkę na module."
-    3. Jeżeli w BAZIE WIEDZY znajduje się link URL do pliku PDF ze schematem, ZAWSZE umieść go w odpowiedzi w formacie Markdown: [Pobierz/Otwórz Schemat PDF](URL).
-    
-    BAZA WIEDZY DOKUMENTACJI TECHNICZNEJ (SCHEMATY):
-    ${contextText || "Brak danych z konkretnych schematów dla tego zapytania."}`;
+TWOJA ROLA:
+1. Masz potężną wiedzę ogólną o stacjach ładowania EV (SLAC, PLC, ISO 15118), elektronice, miernictwie i BHP. Używaj jej do doradzania i tłumaczenia zjawisk technicznych.
+2. Gdy technik pyta o KONKRETNE piny, indeksy lub sposób okablowania dla danego modelu, oprzyj się WYŁĄCZNIE na poniższej BAZIE WIEDZY.
+3. ZAKAZ ZGADYWANIA ZASILAŃ I PINÓW. Jeśli dokumentacja milczy, powiedz: "Nie mam podanego tego na schemacie, upewnij się miernikiem".
+4. Jeśli w BAZIE WIEDZY znajduje się link URL do pliku PDF, ZAWSZE umieść go w odpowiedzi jako markdown: [Pobierz/Otwórz Schemat PDF](URL).
+
+BAZA WIEDZY (SCHEMATY):
+${contextText || "Brak danych z konkretnych schematów dla tego zapytania."}`;
 
     let replyText = "";
     let geminiErrorDetails = "";
@@ -200,7 +220,7 @@ export async function POST(req) {
       }
     }
 
-    // 6. FALLBACK GROQ (TYLKO potężny model 70B, wyrzucamy halucynujący 8B)
+    // 6. FALLBACK GROQ (TYLKO model 70B - ratunkowy)
     if (!replyText && process.env.GROQ_API_KEY) {
       try {
         const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
@@ -212,7 +232,7 @@ export async function POST(req) {
         const chatCompletion = await groq.chat.completions.create({
           messages: groqMessages,
           model: 'llama-3.3-70b-versatile',
-          temperature: 0.0,
+          temperature: 0.1,
         });
         replyText = chatCompletion.choices[0]?.message?.content || "";
         
@@ -222,7 +242,7 @@ export async function POST(req) {
     }
 
     if (!replyText) {
-      replyText = `❌ Odpowiedź zablokowana. Wykorzystano darmowe pule tokenów Groq (limit dobowy) oraz napotkano błąd autoryzacji Gemini.\n\nSzczegóły błędu Google Gemini (sprawdź klucz w Vercelu!):\n\`${geminiErrorDetails}\``;
+      replyText = `❌ Odpowiedź zablokowana.\nSzczegóły błędu Google Gemini:\n\`${geminiErrorDetails}\``;
     }
 
     return NextResponse.json({
