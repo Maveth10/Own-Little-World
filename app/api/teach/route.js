@@ -12,24 +12,30 @@ function getSupabase() {
   return createClient(url, key);
 }
 
+// 1. HIPOKAMP: Wektoryzacja Hugging Face
 async function getEmbedding(text) {
   const apiKey = process.env.HF_API_KEY;
   if (!apiKey) throw new Error("Brak klucza HF_API_KEY");
 
-  const response = await fetch(
-    "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2",
-    {
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", "x-wait-for-model": "true" },
-      method: "POST",
-      body: JSON.stringify({ inputs: text, options: { wait_for_model: true } }),
-    }
-  );
+  try {
+    const response = await fetch(
+      "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2",
+      {
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", "x-wait-for-model": "true" },
+        method: "POST",
+        body: JSON.stringify({ inputs: text, options: { wait_for_model: true } }),
+      }
+    );
 
-  if (!response.ok) throw new Error(`Błąd HF API: ${response.statusText}`);
-  const result = await response.json();
-  if (Array.isArray(result) && Array.isArray(result[0])) return result[0];
-  if (Array.isArray(result)) return result;
-  throw new Error("Nieprawidłowy format wektora");
+    if (!response.ok) throw new Error(`Błąd HTTP: ${response.status} ${response.statusText}`);
+    const result = await response.json();
+    if (Array.isArray(result) && Array.isArray(result[0])) return result[0];
+    if (Array.isArray(result)) return result;
+    throw new Error("Nieprawidłowy format wektora");
+  } catch (err) {
+    // PUŁAPKA NA BŁĄD SIECIOWY HF
+    throw new Error(`Błąd Hugging Face (Wektoryzacja): ${err.message}`);
+  }
 }
 
 // GŁÓWNA FUNKCJA POST - Odbiera pliki od przeglądarki
@@ -68,55 +74,76 @@ Podziel długie teksty na logiczne fragmenty.`;
 
       const visionPrompt = "Przeanalizuj ten obraz/dokument ze szczegółami. Wypisz każdy tekst, oznaczenie komponentów, tabele, schematy połączeń i złącza. Opisz to bardzo technicznie, niczego nie pomijaj. Nie używaj formatu JSON, daj zwykły tekst.";
 
-      const orResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${orApiKey}`,
-          "Content-Type": "application/json",
-          "HTTP-Referer": "https://own-little-world.vercel.app",
-          "X-Title": "Axon AI Serwis"
-        },
-        body: JSON.stringify({
-          model: "nvidia/nemotron-nano-12b2vl:free",
-          messages: [
-            {
-              role: "user",
-              content: [
-                { type: "text", text: visionPrompt },
-                { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Image}` } }
-              ]
-            }
-          ]
-        })
-      });
-
       let visionDescription = "Brak opisu obrazu od modelu wizyjnego.";
-      if (orResponse.ok) {
+      
+      // 2. OCZY: OpenRouter (Nvidia Vision)
+      try {
+        const orResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${orApiKey}`,
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://own-little-world.vercel.app",
+            "X-Title": "Axon AI Serwis"
+          },
+          body: JSON.stringify({
+            model: "nvidia/nemotron-nano-12b2vl:free",
+            messages: [
+              {
+                role: "user",
+                content: [
+                  { type: "text", text: visionPrompt },
+                  { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Image}` } }
+                ]
+              }
+            ]
+          })
+        });
+
+        if (!orResponse.ok) {
+           const errText = await orResponse.text();
+           throw new Error(`API odrzuciło zapytanie: ${orResponse.status} - ${errText}`);
+        }
+        
         const orData = await orResponse.json();
         visionDescription = orData.choices[0]?.message?.content || visionDescription;
+      } catch (err) {
+        // PUŁAPKA NA BŁĄD SIECIOWY OPENROUTER
+        throw new Error(`Błąd OpenRouter (Analiza Obrazu): ${err.message}`);
       }
 
       const groqPrompt = `Użytkownik dodał notatki: "${userInput}"\n\nOpis wgranego pliku (wygenerowany przez analizator wizyjny):\n"${visionDescription}"\n\nPołącz tę wiedzę i przygotuj tablicę JSON do bazy danych według instrukcji.`;
 
-      const chatCompletion = await groq.chat.completions.create({
-        messages: [
-          { role: 'system', content: systemPromptJSON },
-          { role: 'user', content: groqPrompt }
-        ],
-        model: 'llama-3.3-70b-versatile',
-        temperature: 0.1, 
-      });
-      responseText = chatCompletion.choices[0]?.message?.content || "[]";
+      // 3. MÓZG: Groq (Llama)
+      try {
+        const chatCompletion = await groq.chat.completions.create({
+          messages: [
+            { role: 'system', content: systemPromptJSON },
+            { role: 'user', content: groqPrompt }
+          ],
+          model: 'llama-3.3-70b-versatile',
+          temperature: 0.1, 
+        });
+        responseText = chatCompletion.choices[0]?.message?.content || "[]";
+      } catch (err) {
+         throw new Error(`Błąd Groq (Mózg): ${err.message}`);
+      }
 
     } else {
-      const chatCompletion = await groq.chat.completions.create({
-        messages: [{ role: 'system', content: systemPromptJSON }, { role: 'user', content: userInput }],
-        model: 'llama-3.3-70b-versatile',
-        temperature: 0.1,
-      });
-      responseText = chatCompletion.choices[0]?.message?.content || "[]";
+      // Sama notatka (Bez pliku)
+      try {
+        const chatCompletion = await groq.chat.completions.create({
+          messages: [{ role: 'system', content: systemPromptJSON }, { role: 'user', content: userInput }],
+          model: 'llama-3.3-70b-versatile',
+          temperature: 0.1,
+        });
+        responseText = chatCompletion.choices[0]?.message?.content || "[]";
+      } catch (err) {
+         throw new Error(`Błąd Groq (Mózg): ${err.message}`);
+      }
     }
 
+    // Parsowanie JSON
     try {
       chunks = JSON.parse(responseText.replace(/```json/g, '').replace(/```/g, '').trim());
     } catch {
@@ -125,17 +152,25 @@ Podziel długie teksty na logiczne fragmenty.`;
 
     if (!Array.isArray(chunks)) chunks = [chunks];
 
+    // Zapis pliku w Supabase Storage
     let fileUrl = null;
     if (hasFile) {
       const safeName = uploadedFile.name.replace(/[^a-zA-Z0-9.-]/g, '');
       const fileName = `${Date.now()}_${safeName}`;
       const buffer = Buffer.from(await uploadedFile.arrayBuffer());
-      const { data: uploadData, error: uploadError } = await supabase.storage.from('schematy').upload(fileName, buffer, { contentType: uploadedFile.type, upsert: true });
-      if (!uploadError && uploadData) {
-        fileUrl = supabase.storage.from('schematy').getPublicUrl(fileName).data.publicUrl;
+      
+      try {
+        const { data: uploadData, error: uploadError } = await supabase.storage.from('schematy').upload(fileName, buffer, { contentType: uploadedFile.type, upsert: true });
+        if (uploadError) throw uploadError;
+        if (uploadData) {
+          fileUrl = supabase.storage.from('schematy').getPublicUrl(fileName).data.publicUrl;
+        }
+      } catch (err) {
+        throw new Error(`Błąd Supabase (Wgrywanie pliku): ${err.message}`);
       }
     }
 
+    // Dodawanie wpisów do bazy
     const records = [];
     for (const chunk of chunks) {
       if (!chunk.title || !chunk.content) continue;
@@ -147,7 +182,7 @@ Podziel długie teksty na logiczne fragmenty.`;
 
     if (records.length > 0) {
       const { error: dbError } = await supabase.from('memories').insert(records);
-      if (dbError) throw dbError;
+      if (dbError) throw new Error(`Błąd Supabase (Zapis do bazy): ${dbError.message}`);
     }
 
     return NextResponse.json({ success: true, message: `Zakończono! Dodano ${records.length} wpisów do bazy!` });
