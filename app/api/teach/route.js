@@ -12,29 +12,24 @@ function getSupabase() {
   return createClient(url, key);
 }
 
-// Generowanie wektorów w Hugging Face
 async function getEmbedding(text) {
   const apiKey = process.env.HF_API_KEY;
   if (!apiKey) throw new Error("Brak klucza HF_API_KEY");
 
-  try {
-    const response = await fetch(
-      "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2",
-      {
-        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", "x-wait-for-model": "true" },
-        method: "POST",
-        body: JSON.stringify({ inputs: text, options: { wait_for_model: true } }),
-      }
-    );
+  const response = await fetch(
+    "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2",
+    {
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", "x-wait-for-model": "true" },
+      method: "POST",
+      body: JSON.stringify({ inputs: text, options: { wait_for_model: true } }),
+    }
+  );
 
-    if (!response.ok) throw new Error(`Błąd HTTP: ${response.status}`);
-    const result = await response.json();
-    if (Array.isArray(result) && Array.isArray(result[0])) return result[0];
-    if (Array.isArray(result)) return result;
-    throw new Error("Nieprawidłowy format wektora");
-  } catch (err) {
-    throw new Error(`Błąd Hugging Face (Wektoryzacja): ${err.message}`);
-  }
+  if (!response.ok) throw new Error(`Błąd HF API: ${response.status}`);
+  const result = await response.json();
+  if (Array.isArray(result) && Array.isArray(result[0])) return result[0];
+  if (Array.isArray(result)) return result;
+  throw new Error("Nieprawidłowy format wektora");
 }
 
 export async function POST(req) {
@@ -42,12 +37,11 @@ export async function POST(req) {
     const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
     const supabase = getSupabase();
 
-    const formData = await req.formData();
-    const userInput = formData.get('content') || formData.get('prompt') || formData.get('title') || '';
-    const uploadedFile = formData.get('file');
-    const hasFile = uploadedFile && typeof uploadedFile === 'object' && uploadedFile.size > 0;
+    const body = await req.json();
+    const { title = '', content = '', fileUrl = null, fileName = '', fileType = '' } = body;
+    const userInput = content || title || '';
 
-    if (!userInput && !hasFile) {
+    if (!userInput && !fileUrl) {
       return NextResponse.json({ success: false, error: "Brak materiału do analizy." }, { status: 400 });
     }
 
@@ -62,19 +56,19 @@ Zwróć odpowiedź WYŁĄCZNIE jako tablicę obiektów JSON (bez formatowania ma
 Podziel skomplikowane tabele na czytelne fragmenty dla inżyniera.`;
 
     let chunks = [];
-    let extractedPdfText = "";
-    const isPdf = hasFile && (uploadedFile.type === 'application/pdf' || uploadedFile.name.endsWith('.pdf'));
-    const isImage = hasFile && uploadedFile.type && uploadedFile.type.startsWith('image/');
+    const isPdf = fileUrl && (fileType === 'application/pdf' || fileName.endsWith('.pdf'));
+    const isImage = fileUrl && fileType.startsWith('image/');
 
-    // ---------------------------------------------------------
-    // OBSŁUGA PLIKÓW PDF (Ekstrakcja cyfrowego tekstu z CAD/EPLAN)
-    // ---------------------------------------------------------
+    // OBSŁUGA PDF (Pobranie z Supabase Storage i parsowanie tekstu)
     if (isPdf) {
-      const buffer = Buffer.from(await uploadedFile.arrayBuffer());
-      const pdfData = await pdfParse(buffer);
-      extractedPdfText = pdfData.text;
+      const pdfRes = await fetch(fileUrl);
+      if (!pdfRes.ok) throw new Error("Nie udało się pobrać pliku PDF z magazynu Supabase.");
+      const arrayBuffer = await pdfRes.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
 
-      // Pytamy Groqa o przetworzenie tekstu z PDF na czysty JSON
+      const pdfData = await pdfParse(buffer);
+      const extractedPdfText = pdfData.text || "";
+
       const groqPrompt = `Przeanalizuj poniższą dokumentację techniczną z pliku PDF i ustrukturyzuj ją dla serwisanta.\nNotatka użytkownika: "${userInput}"\n\nTREŚĆ DOKUMENTACJI PDF:\n${extractedPdfText.slice(0, 30000)}`;
 
       const chatCompletion = await groq.chat.completions.create({
@@ -90,16 +84,16 @@ Podziel skomplikowane tabele na czytelne fragmenty dla inżyniera.`;
       try {
         chunks = JSON.parse(responseText.replace(/```json/g, '').replace(/```/g, '').trim());
       } catch {
-        chunks = [{ title: uploadedFile.name, content: extractedPdfText.slice(0, 4000) }];
+        chunks = [{ title: fileName || "Dokumentacja PDF", content: extractedPdfText.slice(0, 4000) }];
       }
 
-    // ---------------------------------------------------------
-    // OBSŁUGA ZDJĘĆ (Nvidia Vision przez OpenRouter)
-    // ---------------------------------------------------------
+    // OBSŁUGA ZDJĘĆ
     } else if (isImage) {
-      const buffer = Buffer.from(await uploadedFile.arrayBuffer());
-      const base64Image = buffer.toString("base64");
-      const mimeType = uploadedFile.type || "image/jpeg";
+      const imgRes = await fetch(fileUrl);
+      if (!imgRes.ok) throw new Error("Nie udało się pobrać pliku obrazu z magazynu Supabase.");
+      const arrayBuffer = await imgRes.arrayBuffer();
+      const base64Image = Buffer.from(arrayBuffer).toString("base64");
+      const mimeType = fileType || "image/jpeg";
       const orApiKey = process.env.OPENROUTER_API_KEY;
 
       const visionPrompt = "Przeanalizuj ten obraz ze szczegółami. Wypisz każdy tekst, oznaczenie komponentów, schematy połączeń i złącza.";
@@ -147,12 +141,10 @@ Podziel skomplikowane tabele na czytelne fragmenty dla inżyniera.`;
       try {
         chunks = JSON.parse(responseText.replace(/```json/g, '').replace(/```/g, '').trim());
       } catch {
-        chunks = [{ title: "Wpis ze zdjęcia", content: visionDescription }];
+        chunks = [{ title: fileName || "Wpis ze zdjęcia", content: visionDescription }];
       }
 
-    // ---------------------------------------------------------
-    // OBSŁUGA SAMESO TEKSTU / NOTATKI
-    // ---------------------------------------------------------
+    // OBSŁUGA SAMEGO TEKSTU
     } else {
       const chatCompletion = await groq.chat.completions.create({
         messages: [{ role: 'system', content: systemPromptJSON }, { role: 'user', content: userInput }],
@@ -163,40 +155,37 @@ Podziel skomplikowane tabele na czytelne fragmenty dla inżyniera.`;
       try {
         chunks = JSON.parse(responseText.replace(/```json/g, '').replace(/```/g, '').trim());
       } catch {
-        chunks = [{ title: "Wpis własny", content: userInput }];
+        chunks = [{ title: title || "Wpis własny", content: userInput }];
       }
     }
 
     if (!Array.isArray(chunks)) chunks = [chunks];
 
-    // Zapis ewentualnego pliku w Supabase Storage
-    let fileUrl = null;
-    if (hasFile) {
-      const safeName = uploadedFile.name.replace(/[^a-zA-Z0-9.-]/g, '');
-      const fileName = `${Date.now()}_${safeName}`;
-      const buffer = Buffer.from(await uploadedFile.arrayBuffer());
-      const { data: uploadData } = await supabase.storage.from('schematy').upload(fileName, buffer, { contentType: uploadedFile.type, upsert: true });
-      if (uploadData) {
-        fileUrl = supabase.storage.from('schematy').getPublicUrl(fileName).data.publicUrl;
+    // RÓWNOLEGŁA WEKTORYZACJA (Radykalne przyspieszenie działania)
+    const recordPromises = chunks.map(async (chunk) => {
+      if (!chunk.title || !chunk.content) return null;
+      try {
+        const embedding = await getEmbedding(`${chunk.title}: ${chunk.content}`);
+        if (embedding) {
+          return { title: chunk.title, content: chunk.content, embedding, image_url: fileUrl };
+        }
+      } catch (err) {
+        console.error("Błąd wektoryzacji fragmentu:", err);
       }
-    }
+      return null;
+    });
 
-    // Wektoryzacja w Hugging Face i zapis do bazy danych Supabase
-    const records = [];
-    for (const chunk of chunks) {
-      if (!chunk.title || !chunk.content) continue;
-      const embedding = await getEmbedding(`${chunk.title}: ${chunk.content}`);
-      if (embedding) {
-        records.push({ title: chunk.title, content: chunk.content, embedding, image_url: fileUrl });
-      }
-    }
+    const records = (await Promise.all(recordPromises)).filter(Boolean);
 
     if (records.length > 0) {
       const { error: dbError } = await supabase.from('memories').insert(records);
       if (dbError) throw dbError;
     }
 
-    return NextResponse.json({ success: true, message: `Sukces! Przeanalizowano plik i dodano ${records.length} kompletnych wpisów do bazy wiedzy!` });
+    return NextResponse.json({
+      success: true,
+      message: `Przeanalizowano plik i dodano ${records.length} wpisów do bazy wiedzy!`
+    });
 
   } catch (error) {
     console.error("Błąd w trakcie nauki:", error);
