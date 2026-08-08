@@ -87,7 +87,7 @@ Podziel długie teksty na logiczne fragmenty.`;
             "X-Title": "Axon AI Serwis"
           },
           body: JSON.stringify({
-            model: "nvidia/nemotron-nano-12b2vl:free",
+            model: "nvidia/nemotron-nano-12b-v2-vl:free",
             messages: [
               {
                 role: "user",

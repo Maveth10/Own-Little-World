@@ -74,7 +74,7 @@ export async function POST(req) {
           "X-Title": "Axon AI" 
         },
         body: JSON.stringify({
-          model: "nvidia/nemotron-nano-12b2vl:free", // Używamy Twojego modelu od Nvidii
+          model: "nvidia/nemotron-nano-12b-v2-vl:free", // Używamy Twojego modelu od Nvidii
           messages: [
             {
               role: "user",
