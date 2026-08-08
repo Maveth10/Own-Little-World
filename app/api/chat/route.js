@@ -49,36 +49,11 @@ async function getEmbedding(text) {
   return null;
 }
 
-// INTELIGENTNA integracja z Google Gemini - Dynamiczne pobieranie listy modeli
+// Integracja z Google Gemini API (Bezpośredni strzał do stabilnej wersji)
 async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
-  let targetModel = "gemini-1.5-flash"; // Wartość awaryjna
-  let lastError = "";
+  // Używamy stabilnej wersji 1.5-flash, omijając awaryjny endpoint ListModels
+  const targetModel = "gemini-1.5-flash"; 
 
-  // KROK 1: Pytamy Google o listę faktycznie dostępnych modeli dla tego klucza
-  try {
-    const listUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
-    const listRes = await fetch(listUrl, { method: "GET" });
-    
-    if (listRes.ok) {
-      const listData = await listRes.json();
-      if (listData.models && listData.models.length > 0) {
-        // Wyciągamy modele ze słowem "flash", które wspierają generowanie tekstu (generateContent)
-        const flashModels = listData.models
-          .filter(m => m.name.includes("flash") && m.supportedGenerationMethods?.includes("generateContent"))
-          .map(m => m.name.replace("models/", ""));
-          
-        if (flashModels.length > 0) {
-          // Bierzemy najnowszy działający model z listy (np. gemini-3.5-flash)
-          targetModel = flashModels[flashModels.length - 1]; 
-          console.log("Wykryto dostępne modele Google. Wybrano:", targetModel);
-        }
-      }
-    }
-  } catch(e) {
-    console.warn("Nie udało się pobrać listy modeli Gemini. Próba z wersją domyślną.");
-  }
-
-  // KROK 2: Wywołanie API na 100% istniejącym modelu
   const contents = messagesArray
     .filter(msg => msg.role !== 'system')
     .map(msg => ({
@@ -86,37 +61,33 @@ async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
       parts: [{ text: msg.content || msg.text || "..." }]
     }));
 
-  try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${targetModel}:generateContent?key=${apiKey}`;
-    
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        systemInstruction: {
-          parts: [{ text: systemPrompt }]
-        },
-        contents: contents,
-        generationConfig: {
-          temperature: 0.1,
-          maxOutputTokens: 2048
-        }
-      })
-    });
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${targetModel}:generateContent?key=${apiKey}`;
+  
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      systemInstruction: {
+        parts: [{ text: systemPrompt }]
+      },
+      contents: contents,
+      generationConfig: {
+        temperature: 0.0, // Absolutne 0 - zero kreatywności, tylko fakty
+        maxOutputTokens: 2048
+      }
+    })
+  });
 
-    if (response.ok) {
-      const data = await response.json();
-      const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (text) return text;
-    } else {
-      const errText = await response.text();
-      lastError = `${response.status} - ${errText}`;
-    }
-  } catch (err) {
-    lastError = err.message;
+  if (response.ok) {
+    const data = await response.json();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (text) return text;
+  } else {
+    const errText = await response.text();
+    throw new Error(`Błąd ${response.status}: ${errText}`);
   }
 
-  throw new Error(`Google API odrzuciło zapytanie dla modelu ${targetModel}. Błąd: ${lastError}`);
+  throw new Error("Pusta odpowiedź od Gemini.");
 }
 
 export async function POST(req) {
@@ -134,7 +105,7 @@ export async function POST(req) {
 
     let contextChunks = [];
 
-    // 1. WYSZUKIWANIE WEKTOROWE
+    // 1. SZEROKIE WYSZUKIWANIE WEKTOROWE
     const queryEmbedding = await getEmbedding(lastUserMessage);
 
     if (queryEmbedding) {
@@ -142,7 +113,7 @@ export async function POST(req) {
         const { data: vectorData } = await supabase.rpc('match_ai_memory', {
           query_embedding: queryEmbedding,
           match_threshold: 0.01,
-          match_count: 5
+          match_count: 8 // Zwiększono z 5 do 8
         });
 
         if (vectorData && vectorData.length > 0) {
@@ -153,49 +124,39 @@ export async function POST(req) {
       }
     }
 
-    // 2. WYSZUKIWANIE TEKSTOWE
-    if (contextChunks.length === 0) {
-      const cleanTerms = lastUserMessage
-        .replace(/[^a-zA-Z0-9.-]/g, ' ')
-        .split(' ')
-        .filter(w => w.length >= 2);
+    // 2. SZEROKIE WYSZUKIWANIE TEKSTOWE
+    const cleanTerms = lastUserMessage
+      .replace(/[^a-zA-Z0-9.-]/g, ' ')
+      .split(' ')
+      .filter(w => w.length >= 2);
 
-      try {
-        for (const term of cleanTerms) {
-          const { data: searchResults } = await supabase
-            .from('ai_memory')
-            .select('*')
-            .or(`title.ilike.%${term}%,content.ilike.%${term}%`)
-            .limit(4);
-
-          if (searchResults && searchResults.length > 0) {
-            contextChunks.push(...searchResults);
-          }
-        }
-      } catch (err) {
-        console.warn("Błąd wyszukiwania słów kluczowych:", err.message);
-      }
-
-      if (contextChunks.length === 0) {
-        const { data: recentData } = await supabase
+    try {
+      for (const term of cleanTerms) {
+        const { data: searchResults } = await supabase
           .from('ai_memory')
           .select('*')
-          .order('id', { ascending: false })
-          .limit(3);
+          .or(`title.ilike.%${term}%,content.ilike.%${term}%`)
+          .limit(8); // Zwiększono z 4 do 8 dla każdego słowa kluczowego
 
-        if (recentData) contextChunks = recentData;
+        if (searchResults && searchResults.length > 0) {
+          contextChunks.push(...searchResults);
+        }
       }
+    } catch (err) {
+      console.warn("Błąd wyszukiwania słów kluczowych:", err.message);
     }
 
+    // Usunięcie duplikatów
     const uniqueChunks = Array.from(new Set(contextChunks.map(c => c.id)))
       .map(id => contextChunks.find(c => c.id === id));
 
-    // 3. PRZYGOTOWANIE BAZY WIEDZY
+    // 3. PRZYGOTOWANIE BAZY WIEDZY (Potężny zastrzyk kontekstu)
     let contextText = "";
     const pdfLinks = new Set();
 
-    uniqueChunks.slice(0, 5).forEach((chunk, idx) => {
-      const safeContent = chunk.content.length > 1200 ? chunk.content.substring(0, 1200) + '...' : chunk.content;
+    // Bierzemy aż do 12 fragmentów, każdy do 2000 znaków (Gemini ma ogromny limit, poradzi sobie z tym bez problemu)
+    uniqueChunks.slice(0, 12).forEach((chunk, idx) => {
+      const safeContent = chunk.content.length > 2000 ? chunk.content.substring(0, 2000) + '...' : chunk.content;
       contextText += `\n[DOKUMENT ${idx + 1}: ${chunk.title}]\n${safeContent}\n`;
       if (chunk.image_url) {
         pdfLinks.add(chunk.image_url);
@@ -206,12 +167,17 @@ export async function POST(req) {
       contextText += `\nLINKI DO SCHEMATÓW PDF:\n` + Array.from(pdfLinks).map(url => `- ${url}`).join('\n') + `\n`;
     }
 
+    // 4. RYGORYSTYCZNY SYSTEM PROMPT
     const systemPrompt = `Jesteś Głównym Inżynierem Serwisu Axon AI.
-Odpowiadaj precyzyjnie, zwięźle i technicznie na podstawie BAZY WIEDZY.
-Jeżeli w BAZIE WIEDZY znajduje się link URL do pliku PDF ze schematem, ZAWSZE umieść go w odpowiedzi w formacie Markdown: [Pobierz/Otwórz Schemat PDF](URL).
+Twoim jedynym zadaniem jest analiza BAZY WIEDZY i udzielanie odpowiedzi wyłącznie na jej podstawie.
+
+ABSOLUTNE ZASADY:
+1. ZAKAZ ZGADYWANIA. Jeśli w BAZIE WIEDZY nie ma odpowiedzi na pytanie użytkownika (np. o konkretny pin lub zasilanie), powiedz wprost: "Brak takich danych w udostępnionych schematach."
+2. ZAKAZ PRZEPRASZANIA. Nie używaj sformułowań typu "Przepraszam, ale...", "Nie mam dostępu do...". Jesteś maszyną. Zgłaszaj suche fakty.
+3. Jeśli w BAZIE WIEDZY znajduje się link URL do pliku PDF ze schematem, ZAWSZE umieść go w odpowiedzi w formacie Markdown: [Pobierz/Otwórz Schemat PDF](URL).
 
 BAZA WIEDZY DOKUMENTACJI TECHNICZNEJ:
-${contextText || "Brak danych w bazie."}`;
+${contextText || "Brak jakichkolwiek danych."}`;
 
     let replyText = "";
     let geminiErrorDetails = "";
@@ -220,48 +186,40 @@ ${contextText || "Brak danych w bazie."}`;
       ? messages.slice(-4) 
       : [{ role: 'user', content: lastUserMessage }];
 
-    // 4. WYWOŁANIE GOOGLE GEMINI
+    // 5. WYWOŁANIE GOOGLE GEMINI (Główne)
     const geminiKey = process.env.GEMINI_API_KEY;
     if (geminiKey) {
       try {
         replyText = await callGeminiAPI(systemPrompt, conversationHistory, geminiKey);
       } catch (geminiErr) {
         geminiErrorDetails = geminiErr.message;
-        console.warn("Błąd silników Gemini:", geminiErrorDetails);
+        console.warn("Błąd silnika Gemini:", geminiErrorDetails);
       }
     }
 
-    // 5. FALLBACK GROQ (uruchomi się, jeśli Gemini odrzuci połączenie)
+    // 6. FALLBACK GROQ (TYLKO potężny model 70B, wyrzucamy halucynujący 8B)
     if (!replyText && process.env.GROQ_API_KEY) {
       try {
         const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-        const fallbackModels = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant'];
-
         const groqMessages = [
           { role: 'system', content: systemPrompt },
           ...conversationHistory.map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content || m.text }))
         ];
 
-        for (const modelName of fallbackModels) {
-          try {
-            const chatCompletion = await groq.chat.completions.create({
-              messages: groqMessages,
-              model: modelName,
-              temperature: 0.1,
-            });
-            replyText = chatCompletion.choices[0]?.message?.content || "";
-            if (replyText) break;
-          } catch (groqErr) {
-            console.warn(`Groq (${modelName}) limit lub błąd:`, groqErr.message);
-          }
-        }
+        const chatCompletion = await groq.chat.completions.create({
+          messages: groqMessages,
+          model: 'llama-3.3-70b-versatile',
+          temperature: 0.0,
+        });
+        replyText = chatCompletion.choices[0]?.message?.content || "";
+        
       } catch (e) {
         console.warn("Groq fallback error:", e.message);
       }
     }
 
     if (!replyText) {
-      replyText = `❌ Odpowiedź zablokowana. Wykorzystano darmowe pule tokenów.\n\nSzczegóły Gemini:\n\`${geminiErrorDetails}\``;
+      replyText = `❌ Odpowiedź zablokowana. Wykorzystano darmowe pule tokenów Groq (limit dobowy) oraz napotkano błąd autoryzacji Gemini.\n\nSzczegóły błędu Google Gemini (sprawdź klucz w Vercelu!):\n\`${geminiErrorDetails}\``;
     }
 
     return NextResponse.json({
