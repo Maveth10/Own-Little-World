@@ -49,55 +49,40 @@ async function getEmbedding(text) {
   return null;
 }
 
-// Obsługa zapytania do silników Google Gemini z kaskadą wersji
-async function callGeminiAPI(systemPrompt, userQuery) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    console.warn("Brak zmiennej GEMINI_API_KEY w środowisku Vercel.");
-    return null;
-  }
+// Integracja z Google Gemini API (model 1.5-flash) z obsługą historii
+async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
 
-  const geminiModels = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash"
-  ];
+  // Mapowanie ról z naszego czatu (user/assistant) na format Google (user/model)
+  const contents = messagesArray
+    .filter(msg => msg.role !== 'system') // System prompt przesyłamy oddzielnie
+    .map(msg => ({
+      role: msg.role === 'assistant' || msg.role === 'ai' ? 'model' : 'user',
+      parts: [{ text: msg.content || msg.text || "..." }]
+    }));
 
-  for (const model of geminiModels) {
-    try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [
-            {
-              role: "user",
-              parts: [{ text: `${systemPrompt}\n\nPYTANIE UŻYTKOWNIKA:\n${userQuery}` }]
-            }
-          ],
-          generationConfig: {
-            temperature: 0.1,
-            maxOutputTokens: 2048
-          }
-        })
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (text) return text;
-      } else {
-        const errBody = await response.text();
-        console.warn(`Gemini (${model}) błąd ${response.status}:`, errBody);
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      systemInstruction: {
+        parts: [{ text: systemPrompt }]
+      },
+      contents: contents,
+      generationConfig: {
+        temperature: 0.1,
+        maxOutputTokens: 2048
       }
-    } catch (err) {
-      console.warn(`Błąd połączenia z Gemini (${model}):`, err.message);
-    }
+    })
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`${response.status} - ${errText}`);
   }
 
-  return null;
+  const data = await response.json();
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || null;
 }
 
 export async function POST(req) {
@@ -194,29 +179,41 @@ BAZA WIEDZY DOKUMENTACJI TECHNICZNEJ:
 ${contextText || "Brak danych w bazie."}`;
 
     let replyText = "";
+    let geminiErrorDetails = "";
 
-    // 4. WYWOŁANIE GEMINI (Główny silnik z limitem 1 000 000 TPM)
-    try {
-      replyText = await callGeminiAPI(systemPrompt, lastUserMessage);
-    } catch (geminiErr) {
-      console.warn("Błąd silnika Gemini:", geminiErr.message);
+    // Przygotowanie jednolitej historii rozmowy dla API
+    const conversationHistory = messages.length > 0 
+      ? messages 
+      : [{ role: 'user', content: lastUserMessage }];
+
+    // 4. WYWOŁANIE GOOGLE GEMINI
+    const geminiKey = process.env.GEMINI_API_KEY;
+    if (geminiKey) {
+      try {
+        replyText = await callGeminiAPI(systemPrompt, conversationHistory, geminiKey);
+      } catch (geminiErr) {
+        geminiErrorDetails = geminiErr.message;
+        console.warn("Błąd silnika Gemini:", geminiErrorDetails);
+      }
+    } else {
+      geminiErrorDetails = "Brak klucza GEMINI_API_KEY w środowisku.";
     }
 
-    // 5. FALLBACK GROQ (W przypadku gdyby Gemini nie odpowiedziało)
+    // 5. FALLBACK GROQ (uruchomi się, jeśli Gemini rzuci błędem)
     if (!replyText && process.env.GROQ_API_KEY) {
       try {
         const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
         const fallbackModels = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant'];
 
-        const formattedMessages = [
+        const groqMessages = [
           { role: 'system', content: systemPrompt },
-          { role: 'user', content: lastUserMessage }
+          ...conversationHistory.map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content || m.text }))
         ];
 
         for (const modelName of fallbackModels) {
           try {
             const chatCompletion = await groq.chat.completions.create({
-              messages: formattedMessages,
+              messages: groqMessages,
               model: modelName,
               temperature: 0.1,
             });
@@ -227,12 +224,13 @@ ${contextText || "Brak danych w bazie."}`;
           }
         }
       } catch (e) {
-        console.warn("Inicjalizacja Groq nie powiodła się:", e.message);
+        console.warn("Groq fallback error:", e.message);
       }
     }
 
+    // Wyświetlanie jawnego błędu, jeśli wszystkie metody zawiodą
     if (!replyText) {
-      replyText = "⚠️ Upewnij się, że dodałeś klucz GEMINI_API_KEY w ustawieniach Vercel i wykonałeś Redeploy. Dzienne limity darmowego Groqa zostały wyczerpane.";
+      replyText = `❌ Odpowiedź zablokowana.\nSzczegóły błędu Google Gemini:\n\`${geminiErrorDetails}\``;
     }
 
     return NextResponse.json({
