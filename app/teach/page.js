@@ -36,14 +36,14 @@ export default function TeachAI() {
         fileType = file.type || (file.name.endsWith('.pdf') ? 'application/pdf' : 'image/jpeg');
 
         const { error: uploadError } = await supabase.storage
-          .from('schematy')
+          .from('schematics')
           .upload(fileName, file, { contentType: fileType, upsert: true });
 
         if (uploadError) {
           throw new Error(`Błąd wgrywania pliku do Supabase: ${uploadError.message}`);
         }
 
-        fileUrl = supabase.storage.from('schematy').getPublicUrl(fileName).data.publicUrl;
+        fileUrl = supabase.storage.from('schematics').getPublicUrl(fileName).data.publicUrl;
       }
 
       setStatus('⏳ Przetwarzanie dokumentu przez AI (Analiza i wektoryzacja)...');
