@@ -49,11 +49,11 @@ async function getEmbedding(text) {
   return null;
 }
 
-// INTELIGENTNA integracja z Google Gemini - Dynamiczne pobieranie listy modeli z serwera
+// INTELIGENTNA integracja z Google Gemini - Dynamiczne pobieranie listy modeli z silnym filtrem
 async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
-  let targetModel = "gemini-1.5-flash"; // Wartość domyślna w razie problemów z listą
+  let targetModel = "gemini-1.5-flash"; // Bezpieczna wartość domyślna
 
-  // KROK 1: Dynamiczne zapytanie do Google o dostępne w tej chwili modele
+  // KROK 1: Dynamiczne zapytanie do Google o dostępne modele i rygorystyczne filtrowanie
   try {
     const listUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
     const listRes = await fetch(listUrl, { method: "GET" });
@@ -61,16 +61,28 @@ async function callGeminiAPI(systemPrompt, messagesArray, apiKey) {
     if (listRes.ok) {
       const listData = await listRes.json();
       if (listData.models && listData.models.length > 0) {
-        // Wyciągamy modele z rodziny Gemini wspierające generowanie treści, preferujemy szybkie modele Flash
-        const validModels = listData.models
-          .filter(m => m.name.includes("gemini") && m.supportedGenerationMethods?.includes("generateContent"))
+        
+        // Wyciągamy modele flash, ale wyrzucamy TTS, Audio, Vision i Embeddingi
+        const flashModels = listData.models
+          .filter(m => 
+            m.name.includes("gemini") && 
+            m.name.includes("flash") && 
+            !m.name.includes("tts") && 
+            !m.name.includes("audio") && 
+            !m.name.includes("vision") && 
+            m.supportedGenerationMethods?.includes("generateContent")
+          )
           .map(m => m.name.replace("models/", ""));
           
-        if (validModels.length > 0) {
-          const flashModels = validModels.filter(m => m.includes("flash"));
-          // Jeśli jest lista flash, wybieramy jeden z nich, w przeciwnym razie bierzemy pierwszy działający
-          targetModel = flashModels.length > 0 ? flashModels[flashModels.length - 1] : validModels[0];
-          console.log("Dynamicznie wybrano model Gemini z serwera Google:", targetModel);
+        if (flashModels.length > 0) {
+          // Staramy się unikać wersji 'preview' oraz 'exp' na rzecz stabilnych wydań
+          const stableModels = flashModels.filter(m => !m.includes("preview") && !m.includes("exp"));
+          
+          targetModel = stableModels.length > 0 
+            ? stableModels[stableModels.length - 1] 
+            : flashModels[flashModels.length - 1];
+            
+          console.log("Dynamicznie wybrano STABILNY model Gemini:", targetModel);
         }
       }
     }

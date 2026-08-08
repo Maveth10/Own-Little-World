@@ -7,7 +7,7 @@ export default function AxonAI() {
   const [messages, setMessages] = useState([
     {
       role: 'ai',
-      text: 'Witaj! Jestem głównym inżynierem Axon AI. Opisz problem lub podaj symbol stacji/komponentu, a ja przeanalizuję schematy.',
+      text: 'Witaj! Jestem głównym inżynierem Axon AI. Opisz problem, podaj symbol stacji lub wklej (Ctrl+V) zrzut ekranu ze schematu.',
     },
   ]);
   const [input, setInput] = useState('');
@@ -54,10 +54,33 @@ export default function AxonAI() {
     return parts.length > 0 ? parts : text;
   };
 
+  // Obsługa tradycyjnego wgrywania pliku
   const handleImageUpload = (e) => {
     const file = e.target.files ? e.target.files[0] : null;
     if (file) {
       setImage(file);
+    }
+  };
+
+  // NOWOŚĆ: Obsługa wklejania ze schowka (Ctrl+V)
+  const handlePaste = (e) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].type.indexOf('image') !== -1) {
+        // Zatrzymujemy domyślne wklejanie (żeby przeglądarka nie próbowała wkleić np. nazwy pliku do tekstu)
+        e.preventDefault(); 
+        
+        const file = items[i].getAsFile();
+        if (file) {
+          // Zmieniamy nazwę na bardziej czytelną (domyślnie ze schowka to często po prostu 'image.png')
+          const timestamp = new Date().toLocaleTimeString().replace(/:/g, '-');
+          const pastedFile = new File([file], `Wklejony_zrzut_${timestamp}.png`, { type: file.type });
+          setImage(pastedFile);
+          break; // Pobieramy tylko jeden obraz na raz
+        }
+      }
     }
   };
 
@@ -82,7 +105,7 @@ export default function AxonAI() {
       ...prev,
       {
         role: 'sys',
-        text: currentImage ? 'Analizuję treść i szukam w bazie wiedzy...' : 'Szukam w bazie wiedzy i generuję odpowiedź...',
+        text: currentImage ? 'Analizuję obraz i szukam w bazie wiedzy...' : 'Szukam w bazie wiedzy i generuję odpowiedź...',
       },
     ]);
 
@@ -94,6 +117,8 @@ export default function AxonAI() {
           content: m.text,
         }));
 
+      // NOTE: Jeśli w przyszłości dodamy pełną obsługę wizyjną w Gemini,
+      // tutaj trzeba będzie wysyłać obraz w Base64 w formacie JSON
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: {
@@ -141,7 +166,7 @@ export default function AxonAI() {
           <Bot className="text-yellow-500" size={28} /> Robocop Axon AI
         </h1>
         <p className="text-xs text-gray-500 mt-1 font-medium">
-          Wyszukiwanie schematów w bazie ai_memory | Silnik Llama 70B
+          Wyszukiwanie schematów w bazie ai_memory | Wsparcie wklejania (Ctrl+V)
         </p>
       </header>
 
@@ -195,16 +220,18 @@ export default function AxonAI() {
             />
           </label>
 
+          {/* POLE PROMPTA Z OBSŁUGĄ WKLEJANIA (onPaste) */}
           <input
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleSend()}
+            onPaste={handlePaste} 
             disabled={loading}
             placeholder={
               image
                 ? `Załączono: ${image.name} - opisz problem...`
-                : 'Zadaj pytanie (np. jaki indeks ma 1A8 w 3-21-52.0189?)...'
+                : 'Zadaj pytanie lub wklej wycinek ze schematu (Ctrl+V)...'
             }
             className="flex-1 p-3 bg-white text-gray-900 placeholder-gray-400 border border-gray-300 rounded-lg focus:outline-none focus:border-yellow-400 focus:ring-2 focus:ring-yellow-400 transition-all font-medium text-base"
           />
@@ -221,6 +248,7 @@ export default function AxonAI() {
           </button>
         </div>
 
+        {/* Podgląd przygotowanego pliku ze schowka */}
         {image && (
           <div className="max-w-4xl mx-auto text-xs text-green-700 font-bold mt-2 flex items-center justify-between bg-green-50 p-2 rounded border border-green-200">
             <span>📷 Gotowe do analizy: {image.name}</span>
