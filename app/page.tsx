@@ -1,25 +1,57 @@
 'use client';
 
 import { useState, useRef, useEffect } from 'react';
-import { Send, Upload, Camera, Bot } from 'lucide-react';
+import { Send, Upload, Camera, Bot, Trash2 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
 export default function AxonAI() {
-  const [messages, setMessages] = useState([
-    {
-      role: 'ai',
-      text: 'Witaj! Jestem głównym inżynierem Axon AI. Opisz problem, podaj symbol stacji lub wklej (Ctrl+V) zrzut ekranu ze schematu.',
-    },
-  ]);
+  const defaultMessage = {
+    role: 'ai',
+    text: 'Witaj! Jestem głównym inżynierem Axon AI. Opisz problem, podaj symbol stacji lub wklej (Ctrl+V) zrzut ekranu ze schematu.',
+  };
+
+  const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [image, setImage] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [isClient, setIsClient] = useState(false);
 
-  // Referencja do automatycznego przewijania
   const messagesEndRef = useRef(null);
 
-  // Efekt przewijający do dołu po każdej zmianie w wiadomościach
+  // KROK 1: Ładowanie historii z LocalStorage przy uruchomieniu aplikacji
+  useEffect(() => {
+    setIsClient(true);
+    const savedChat = localStorage.getItem('axon_chat_history');
+    if (savedChat) {
+      try {
+        setMessages(JSON.parse(savedChat));
+      } catch (e) {
+        console.error('Błąd ładowania historii:', e);
+        setMessages([defaultMessage]);
+      }
+    } else {
+      setMessages([defaultMessage]);
+    }
+  }, []);
+
+  // KROK 2: Zapisywanie do LocalStorage przy KAŻDEJ nowej wiadomości
+  useEffect(() => {
+    if (isClient && messages.length > 0) {
+      // Nie zapisujemy komunikatów systemowych typu "Szukam w bazie..."
+      const historyToSave = messages.filter(m => m.role !== 'sys');
+      localStorage.setItem('axon_chat_history', JSON.stringify(historyToSave));
+    }
+  }, [messages, isClient]);
+
+  // Funkcja czyszcząca historię
+  const handleClearHistory = () => {
+    if (window.confirm('Czy na pewno chcesz wyczyścić historię czatu?')) {
+      setMessages([defaultMessage]);
+      localStorage.removeItem('axon_chat_history');
+    }
+  };
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
@@ -93,13 +125,24 @@ export default function AxonAI() {
     }
   };
 
+  // Renderowanie tylko po załadowaniu klienta (zapobiega błędom Hydration w Next.js)
+  if (!isClient) return <div className="h-screen bg-gray-100 flex items-center justify-center">Ładowanie systemu...</div>;
+
   return (
     <div className="flex flex-col h-screen bg-gray-100 font-sans text-gray-900">
-      <header className="bg-white border-b-4 border-yellow-400 p-5 text-center shadow-sm shrink-0">
+      <header className="bg-white border-b-4 border-yellow-400 p-5 text-center shadow-sm shrink-0 relative">
         <h1 className="text-2xl font-black uppercase tracking-widest text-gray-900 flex items-center justify-center gap-2">
           <Bot className="text-yellow-500" size={28} /> Robocop Axon AI
         </h1>
-        <p className="text-xs text-gray-500 mt-1 font-medium">Wyszukiwanie schematów | Automatyczne przewijanie | Markdown</p>
+        <p className="text-xs text-gray-500 mt-1 font-medium">Wyszukiwanie schematów | Ctrl+V | Markdown</p>
+        
+        {/* PRZYCISK CZYSZCZENIA HISTORII */}
+        <button 
+          onClick={handleClearHistory}
+          className="absolute right-4 top-1/2 -translate-y-1/2 flex items-center gap-1 px-3 py-1.5 bg-red-50 text-red-600 hover:bg-red-100 hover:text-red-700 font-bold text-xs rounded-md transition-colors border border-red-200"
+        >
+          <Trash2 size={14} /> Wyczyść czat
+        </button>
       </header>
 
       <div className="flex-1 overflow-y-auto p-4 md:p-8 space-y-6">
@@ -120,7 +163,6 @@ export default function AxonAI() {
                   </div>
                 )}
                 
-                {/* RENDEROWANIE MARKDOWN DLA ODPOWIEDZI AI */}
                 {msg.role === 'ai' ? (
                   <ReactMarkdown
                     remarkPlugins={[remarkGfm]}
@@ -147,7 +189,6 @@ export default function AxonAI() {
             )}
           </div>
         ))}
-        {/* Pusty div służący jako kotwica do przewijania */}
         <div ref={messagesEndRef} />
       </div>
 
