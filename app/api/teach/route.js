@@ -26,79 +26,52 @@ function chunkTextWithOverlap(text, chunkSize = 600, overlap = 200) {
   return chunks;
 }
 
-let cachedEmbeddingModel = null;
+// Narzędzie do sztucznej pauzy (omijanie błędu 429)
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Dynamiczne sprawdzanie, który model wektorowy jest aktywny na serwerach Google
-async function getAvailableEmbeddingModel(apiKey) {
-  if (cachedEmbeddingModel) return cachedEmbeddingModel;
-
-  try {
-    const listUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
-    const res = await fetch(listUrl, { method: "GET" });
-    if (res.ok) {
-      const data = await res.json();
-      const embedModels = (data.models || [])
-        .filter(m => 
-          m.supportedGenerationMethods?.includes("embedContent") ||
-          m.supportedGenerationMethods?.includes("embedText")
-        )
-        .map(m => m.name.replace("models/", ""));
-
-      if (embedModels.length > 0) {
-        // Preferujemy najnowsze text-embedding-004 lub bierzemy pierwszy z listy
-        const preferred = embedModels.find(m => m.includes("text-embedding-004")) || embedModels[0];
-        cachedEmbeddingModel = preferred;
-        console.log("Wykryto dostępny model wektorowy Google:", cachedEmbeddingModel);
-        return cachedEmbeddingModel;
-      }
-    }
-  } catch (err) {
-    console.warn("Nie udało się pobrać listy modeli wektorowych:", err.message);
-  }
-
-  return "text-embedding-004";
-}
-
-// Pobieranie wektora dla pojedynczego fragmentu
-async function getEmbeddingSingle(text, apiKey) {
-  const model = await getAvailableEmbeddingModel(apiKey);
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent?key=${apiKey}`;
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: `models/${model}`,
-      content: { parts: [{ text: text.slice(0, 8000) }] }
-    })
-  });
-
-  if (response.ok) {
-    const data = await response.json();
-    if (data.embedding?.values) {
-      return data.embedding.values;
-    }
-  }
-
-  const errText = await response.text();
-  throw new Error(`Błąd wektoryzacji Google (${model}): ${errText}`);
-}
-
-// Równoległe pobieranie wektorów w paczkach
+// ZBIORCZE POBIERANIE WEKTORÓW (Odporne na 429 Rate Limit)
 async function getBatchEmbeddingsGemini(textArray) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error("Brak klucza GEMINI_API_KEY w pliku .env!");
   }
 
-  const batchSize = 10;
+  const model = "text-embedding-004"; // Używamy twardo najlepszego modelu
+  const batchSize = 100; // Maksymalnie 100 elementów w jednym zapytaniu API!
   const allEmbeddings = [];
 
   for (let i = 0; i < textArray.length; i += batchSize) {
     const chunkBatch = textArray.slice(i, i + batchSize);
-    const promises = chunkBatch.map(text => getEmbeddingSingle(text, apiKey));
-    const batchResults = await Promise.all(promises);
-    allEmbeddings.push(...batchResults);
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:batchEmbedContents?key=${apiKey}`;
+
+    const requests = chunkBatch.map(text => ({
+      model: `models/${model}`,
+      content: { parts: [{ text: text.slice(0, 8000) }] }
+    }));
+
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ requests })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        const embeddings = data.embeddings?.map(e => e.values) || [];
+        allEmbeddings.push(...embeddings);
+      } else {
+        const errText = await response.text();
+        throw new Error(`Google API Error (${response.status}): ${errText}`);
+      }
+    } catch (err) {
+      throw new Error(`Błąd wektoryzacji paczki: ${err.message}`);
+    }
+
+    // Dodajemy bezpieczne opóźnienie między wysyłką kolejnych paczek
+    if (i + batchSize < textArray.length) {
+      await sleep(1500); 
+    }
   }
 
   return allEmbeddings;
@@ -153,8 +126,13 @@ export async function POST(req) {
       return NextResponse.json({ success: false, error: "Brak treści do zapisania." }, { status: 400 });
     }
 
+    // Wyciągamy teksty i zmieniamy w wektory
     const prepTexts = textChunks.map(c => `${c.title}:\n${c.content}`);
     const embeddings = await getBatchEmbeddingsGemini(prepTexts);
+
+    if (embeddings.length !== textChunks.length) {
+      throw new Error(`Wystąpił błąd silnika. Liczba wektorów (${embeddings.length}) nie zgadza się z liczbą fragmentów tekstu (${textChunks.length}).`);
+    }
 
     const records = textChunks.map((chunk, i) => ({
       title: chunk.title,
@@ -168,7 +146,7 @@ export async function POST(req) {
 
     return NextResponse.json({
       success: true,
-      message: `Przetworzono pomyślnie! Zapisano ${records.length} fragmentów w tabeli ai_memory.`
+      message: `Przetworzono pomyślnie! Zapisano ${records.length} precyzyjnych fragmentów na silniku text-embedding-004.`
     });
 
   } catch (error) {
