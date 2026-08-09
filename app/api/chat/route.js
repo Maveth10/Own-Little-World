@@ -11,51 +11,53 @@ function getSupabase() {
   return createClient(url, key);
 }
 
-let cachedChatEmbeddingModel = null;
+let embedModelsCache = [];
 
 async function getEmbedding(text) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return null;
 
-  try {
-    if (!cachedChatEmbeddingModel) {
+  // Ładujemy magazynek jeśli pusty
+  if (embedModelsCache.length === 0) {
+    try {
       const listUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
-      const res = await fetch(listUrl, { method: "GET" });
+      const res = await fetch(listUrl);
       if (res.ok) {
         const data = await res.json();
-        const embedModels = (data.models || [])
-          .filter(m => 
-            m.supportedGenerationMethods?.includes("embedContent") ||
-            m.supportedGenerationMethods?.includes("embedText")
-          )
+        embedModelsCache = (data.models || [])
+          .filter(m => m.supportedGenerationMethods?.includes("embedContent"))
           .map(m => m.name.replace("models/", ""));
+      }
+    } catch (e) {}
+    if (embedModelsCache.length === 0) embedModelsCache = ["text-embedding-004", "embedding-001"];
+  }
 
-        if (embedModels.length > 0) {
-          cachedChatEmbeddingModel = embedModels.find(m => m.includes("text-embedding-004")) || embedModels[0];
+  // Rotacyjna próba wyciągnięcia wektora na czacie
+  for (let i = 0; i < embedModelsCache.length; i++) {
+    const model = embedModelsCache[i];
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent?key=${apiKey}`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: `models/${model}`,
+          content: { parts: [{ text: text.slice(0, 8000) }] }
+        })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        if (data.embedding?.values) {
+          // Jeśli model zadziałał, wrzucamy go na pierwsze miejsce w kolejce, by używać go domyślnie
+          embedModelsCache.splice(i, 1);
+          embedModelsCache.unshift(model);
+          return data.embedding.values;
         }
       }
+    } catch (err) {
+      console.warn(`Błąd wektoryzacji na modelu ${model}. Przeskakuję...`);
     }
-
-    const model = cachedChatEmbeddingModel || "text-embedding-004";
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent?key=${apiKey}`;
-    
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: `models/${model}`,
-        content: { parts: [{ text: text.slice(0, 8000) }] }
-      })
-    });
-
-    if (response.ok) {
-      const data = await response.json();
-      if (data.embedding?.values) {
-        return data.embedding.values;
-      }
-    }
-  } catch (err) {
-    console.warn("Błąd wektoryzacji zapytania czatu:", err.message);
   }
 
   return null;
