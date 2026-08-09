@@ -157,91 +157,78 @@ export default function TeachAI() {
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       const safeName = file.name.replace(/[^a-zA-Z0-9.-]/g, '');
-
-      // Sprawdzenie duplikatu
-      const isDuplicate = existingStorageFiles.some((existing) =>
-        existing.endsWith(safeName.toLowerCase())
-      );
+      const isDuplicate = existingStorageFiles.some((existing) => existing.endsWith(safeName.toLowerCase()));
 
       if (isDuplicate) {
         skippedCount++;
-        setStats({
-          current: i + 1,
-          total: files.length,
-          success: successCount,
-          skipped: skippedCount,
-          failed: failedCount,
-        });
+        setStats({ current: i + 1, total: files.length, success: successCount, skipped: skippedCount, failed: failedCount });
         setStatus(`⏭️ [${i + 1}/${files.length}] Pominięto duplikat: ${file.name}`);
-        await new Promise((r) => setTimeout(r, 150));
         continue;
       }
 
-      try {
-        setStatus(`⏳ [${i + 1}/${files.length}] Wysyłanie: ${file.name}...`);
-        const fileName = `${Date.now()}_${safeName}`;
-        const fileType = file.type || (file.name.endsWith('.pdf') ? 'application/pdf' : 'image/jpeg');
+      let fileProcessed = false;
+      let retryWait = 60; // Zaczynamy od 60 sekund pauzy
 
-        const { error: uploadError } = await supabase.storage
-          .from('schematics')
-          .upload(fileName, file, { contentType: fileType, upsert: true });
-
-        if (uploadError) throw new Error(uploadError.message);
-
-        const fileUrl = supabase.storage.from('schematics').getPublicUrl(fileName).data.publicUrl;
-        existingStorageFiles.push(fileName.toLowerCase());
-
-        setStatus(`🧠 [${i + 1}/${files.length}] Analiza AI: ${file.name}...`);
-
-        const res = await fetch('/api/teach', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            title: title ? `${title} (${file.name})` : file.name,
-            content,
-            fileUrl,
-            fileName: file.name,
-            fileType,
-          }),
-        });
-
-        const rawText = await res.text();
-        let data;
+      while (!fileProcessed) {
         try {
-          data = JSON.parse(rawText);
-        } catch {
-          data = { success: false };
-        }
+          setStatus(`⏳ [${i + 1}/${files.length}] Wysyłanie: ${file.name}...`);
+          const fileName = `${Date.now()}_${safeName}`;
+          const fileType = file.type || (file.name.endsWith('.pdf') ? 'application/pdf' : 'image/jpeg');
 
-        if (data.success) {
-          successCount++;
-        } else {
+          // Upload do Storage
+          const { error: uploadError } = await supabase.storage.from('schematics').upload(fileName, file, { contentType: fileType, upsert: true });
+          if (uploadError) throw new Error(uploadError.message);
+
+          const fileUrl = supabase.storage.from('schematics').getPublicUrl(fileName).data.publicUrl;
+          
+          setStatus(`🧠 [${i + 1}/${files.length}] Analiza wektorowa: ${file.name}...`);
+          const res = await fetch('/api/teach', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              title: title ? `${title} (${file.name})` : file.name,
+              content, fileUrl, fileName: file.name, fileType,
+            }),
+          });
+
+          if (res.status === 429) {
+            // GOOGLE SIĘ ZMĘCZYŁO! Odpalamy inteligentną pauzę w przeglądarce.
+            for (let s = retryWait; s > 0; s--) {
+              setStatus(`⏸️ Limit API Google. Czekam na zresetowanie licznika: ${s} sekund...`);
+              await new Promise(r => setTimeout(r, 1000));
+            }
+            retryWait += 15; // Gdyby nadal było mało, następna pauza będzie dłuższa
+            continue; // PĘTLA ZWRACA NAS DO TEGO SAMEGO PLIKU!
+          }
+
+          const rawText = await res.text();
+          let data;
+          try { data = JSON.parse(rawText); } catch { data = { success: false }; }
+
+          if (data.success) {
+            existingStorageFiles.push(fileName.toLowerCase());
+            successCount++;
+            fileProcessed = true; // Udało się, wychodzimy z pętli pliku
+          } else {
+            failedCount++;
+            fileProcessed = true; // Inny błąd, poddajemy się z tym plikiem
+          }
+        } catch (err) {
           failedCount++;
+          fileProcessed = true;
         }
-      } catch (err) {
-        console.error(`Błąd przetwarzania ${file.name}:`, err);
-        failedCount++;
       }
 
-      setStats({
-        current: i + 1,
-        total: files.length,
-        success: successCount,
-        skipped: skippedCount,
-        failed: failedCount,
-      });
-
-      await new Promise((r) => setTimeout(r, 1000));
+      setStats({ current: i + 1, total: files.length, success: successCount, skipped: skippedCount, failed: failedCount });
+      await new Promise((r) => setTimeout(r, 1500)); // Standardowa przerwa między plikami
     }
 
-    setStatus(
-      `🎉 Zakończono! Zapisano nowych: ${successCount}, Pominięto duplikatów: ${skippedCount}, Błędy: ${failedCount}`
-    );
+    setStatus(`🎉 Zakończono! Zapisano nowych: ${successCount}, Pominięto duplikatów: ${skippedCount}, Błędy: ${failedCount}`);
     setIsProcessing(false);
     setFiles([]);
     setTitle('');
     setContent('');
-  };
+  }
 
   return (
     <div className="p-8 max-w-3xl mx-auto font-sans">
