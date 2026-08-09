@@ -11,7 +11,7 @@ function getSupabase() {
   return createClient(url, key);
 }
 
-// Precyzyjne cięcie tekstu dla schematów
+// Precyzyjne cięcie tekstu
 function chunkTextWithOverlap(text, chunkSize = 600, overlap = 200) {
   const chunks = [];
   let start = 0;
@@ -27,61 +27,68 @@ function chunkTextWithOverlap(text, chunkSize = 600, overlap = 200) {
   return chunks;
 }
 
-// Funkcja pauzy (zapobiega błędom 429)
+// Narzędzie do pauzowania
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Pobieranie POJEDYNCZEGO wektora z wbudowanym systemem ratunkowym (fallback)
-async function getEmbeddingSingle(text, apiKey) {
-  // Lista modeli do przetestowania (oba generują wektor 768)
-  const modelsToTry = ["text-embedding-004", "embedding-001"];
-  let lastError = "";
-
-  for (const model of modelsToTry) {
-    try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent?key=${apiKey}`;
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: `models/${model}`,
-          content: { parts: [{ text: text.slice(0, 8000) }] }
-        })
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        if (data.embedding?.values) {
-          return data.embedding.values;
-        }
-      } else {
-        lastError = await response.text();
-        // Jeśli wyrzuci błąd limitu, robimy krótką pauzę przed próbą ratunkową
-        if (response.status === 429) await sleep(1000);
-      }
-    } catch (err) {
-      lastError = err.message;
-    }
-  }
-
-  throw new Error(`Google API całkowicie odrzuciło prośbę. Ostatni błąd: ${lastError}`);
-}
-
-// SEKWENCYJNE WYSYŁANIE - Gwarantuje ominięcie wszystkich blokad
+// POTĘŻNE WYSYŁANIE ZBIORCZE (Paczki po 50 elementów = kosztuje tylko 1 zapytanie API)
 async function getBatchEmbeddingsGemini(textArray) {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error("Brak klucza GEMINI_API_KEY w pliku .env!");
-  }
+  if (!apiKey) throw new Error("Brak klucza GEMINI_API_KEY w pliku .env!");
 
+  const modelName = "text-embedding-004"; // Sztywno najlepszy model!
+  const batchSize = 50; 
   const allEmbeddings = [];
 
-  // Pętla wysyła zapytania jedno po drugim, bez ryzykownego "batchingu"
-  for (let i = 0; i < textArray.length; i++) {
-    const vector = await getEmbeddingSingle(textArray[i], apiKey);
-    allEmbeddings.push(vector);
+  for (let i = 0; i < textArray.length; i += batchSize) {
+    const chunkBatch = textArray.slice(i, i + batchSize);
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:batchEmbedContents?key=${apiKey}`;
+
+    const requests = chunkBatch.map(text => ({
+      model: `models/${modelName}`,
+      content: { parts: [{ text: text.slice(0, 8000) }] }
+    }));
+
+    let retries = 3;
+    let success = false;
+
+    while (retries > 0 && !success) {
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ requests })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const embeddings = data.embeddings?.map(e => e.values) || [];
+          allEmbeddings.push(...embeddings);
+          success = true;
+        } else {
+          const errText = await response.text();
+          
+          // Jeśli to błąd limitu (429), zatrzymujemy skrypt na 10 sekund i próbujemy ponownie!
+          if (response.status === 429) {
+            console.warn(`⏳ Limit 429 od Google. Pauzuję na 10 sekund... (Pozostało prób: ${retries - 1})`);
+            await sleep(10000); 
+            retries--;
+          } else {
+            throw new Error(`Google API Error (${response.status}): ${errText}`);
+          }
+        }
+      } catch (err) {
+        if (!err.message.includes("429")) throw err; // Wyrzucamy błędy inne niż limit
+      }
+    }
     
-    // Kluczowa pauza 350 milisekund (~3 zapytania na sekundę, perfekcyjnie w limitach darmowego konta)
-    await sleep(350); 
+    if (!success) {
+      throw new Error(`Nie udało się pobrać wektorów po 3 próbach. Prawdopodobnie wyczerpano stały limit Google API.`);
+    }
+
+    // Standardowa krótka przerwa między paczkami dla bezpieczeństwa
+    if (i + batchSize < textArray.length) {
+      await sleep(2000); 
+    }
   }
 
   return allEmbeddings;
@@ -140,7 +147,7 @@ export async function POST(req) {
     const embeddings = await getBatchEmbeddingsGemini(prepTexts);
 
     if (embeddings.length !== textChunks.length) {
-      throw new Error(`Wystąpił błąd silnika. Liczba wektorów (${embeddings.length}) nie zgadza się z liczbą fragmentów tekstu (${textChunks.length}).`);
+      throw new Error(`Błąd: Liczba wygenerowanych wektorów (${embeddings.length}) nie zgadza się z liczbą fragmentów (${textChunks.length}).`);
     }
 
     const records = textChunks.map((chunk, i) => ({
@@ -155,7 +162,7 @@ export async function POST(req) {
 
     return NextResponse.json({
       success: true,
-      message: `Przetworzono pomyślnie! Zapisano ${records.length} precyzyjnych fragmentów na silniku wektorowym Google.`
+      message: `Przetworzono pomyślnie! Zapisano ${records.length} fragmentów do bazy.`
     });
 
   } catch (error) {
