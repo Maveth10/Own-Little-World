@@ -166,64 +166,86 @@ export default function TeachAI() {
         continue;
       }
 
-      let fileProcessed = false;
-      let retryWait = 60; // Zaczynamy od 60 sekund pauzy
+      try {
+        // KROK 1: UPLOAD (Wykona się TYLKO RAZ)
+        setStatus(`⏳ [${i + 1}/${files.length}] Krok 1/3: Wgrywanie pliku ${file.name} do Supabase...`);
+        const fileName = `${Date.now()}_${safeName}`;
+        const fileType = file.type || (file.name.endsWith('.pdf') ? 'application/pdf' : 'image/jpeg');
 
-      while (!fileProcessed) {
-        try {
-          setStatus(`⏳ [${i + 1}/${files.length}] Wysyłanie: ${file.name}...`);
-          const fileName = `${Date.now()}_${safeName}`;
-          const fileType = file.type || (file.name.endsWith('.pdf') ? 'application/pdf' : 'image/jpeg');
+        const { error: uploadError } = await supabase.storage.from('schematics').upload(fileName, file, { contentType: fileType, upsert: true });
+        if (uploadError) throw new Error(uploadError.message);
 
-          // Upload do Storage
-          const { error: uploadError } = await supabase.storage.from('schematics').upload(fileName, file, { contentType: fileType, upsert: true });
-          if (uploadError) throw new Error(uploadError.message);
+        const fileUrl = supabase.storage.from('schematics').getPublicUrl(fileName).data.publicUrl;
+        existingStorageFiles.push(fileName.toLowerCase());
 
-          const fileUrl = supabase.storage.from('schematics').getPublicUrl(fileName).data.publicUrl;
-          
-          setStatus(`🧠 [${i + 1}/${files.length}] Analiza wektorowa: ${file.name}...`);
-          const res = await fetch('/api/teach', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              title: title ? `${title} (${file.name})` : file.name,
-              content, fileUrl, fileName: file.name, fileType,
-            }),
-          });
+        // KROK 2: PARSOWANIE (Tniemy PDF na tysiące kawałków)
+        setStatus(`🔍 [${i + 1}/${files.length}] Krok 2/3: Odczytywanie i cięcie tekstu z PDF...`);
+        const parseRes = await fetch('/api/teach', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'parse', title: title ? `${title} (${file.name})` : file.name, content, fileUrl, fileName: file.name, fileType }),
+        });
 
-          if (res.status === 429) {
-            // GOOGLE SIĘ ZMĘCZYŁO! Odpalamy inteligentną pauzę w przeglądarce.
-            for (let s = retryWait; s > 0; s--) {
-              setStatus(`⏸️ Limit API Google. Czekam na zresetowanie licznika: ${s} sekund...`);
-              await new Promise(r => setTimeout(r, 1000));
+        const parseData = await parseRes.json();
+        if (!parseData.success || !parseData.chunks) throw new Error(parseData.error || "Błąd parsowania PDF.");
+
+        const allChunks = parseData.chunks;
+        
+        // KROK 3: STRUMIENIOWANIE WEKTORÓW (Odporne na wszystko)
+        const batchSize = 50;
+        let savedChunksCount = 0;
+
+        for (let j = 0; j < allChunks.length; j += batchSize) {
+          const chunkBatch = allChunks.slice(j, j + batchSize);
+          let batchSuccess = false;
+          let waitTime = 60; // 60 sekund pauzy na wypadek 429
+
+          while (!batchSuccess) {
+            setStatus(`🧠 [${i + 1}/${files.length}] Krok 3/3: Wektoryzacja paczki ${j+1}-${Math.min(j+batchSize, allChunks.length)} / ${allChunks.length} z pliku ${file.name}...`);
+            
+            const embedRes = await fetch('/api/teach', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ action: 'embed', chunks: chunkBatch }),
+            });
+
+            if (embedRes.status === 429) {
+              // Zmęczenie materiału? Czekamy i ponawiamy TYLKO TĘ paczkę!
+              for (let s = waitTime; s > 0; s--) {
+                setStatus(`⏸️ Limit API Google. Pauza: ${s} sek. (Partia ${j+1}-${Math.min(j+batchSize, allChunks.length)} / ${allChunks.length})`);
+                await new Promise(r => setTimeout(r, 1000));
+              }
+              waitTime += 15; // wydłużamy kolejną przerwę gdyby nie pomogło
+              continue; 
             }
-            retryWait += 15; // Gdyby nadal było mało, następna pauza będzie dłuższa
-            continue; // PĘTLA ZWRACA NAS DO TEGO SAMEGO PLIKU!
-          }
 
-          const rawText = await res.text();
-          let data;
-          try { data = JSON.parse(rawText); } catch { data = { success: false }; }
+            if (!embedRes.ok) throw new Error("Błąd podczas wektoryzacji paczki.");
 
-          if (data.success) {
-            existingStorageFiles.push(fileName.toLowerCase());
-            successCount++;
-            fileProcessed = true; // Udało się, wychodzimy z pętli pliku
-          } else {
-            failedCount++;
-            fileProcessed = true; // Inny błąd, poddajemy się z tym plikiem
+            const embedData = await embedRes.json();
+            if (embedData.success) {
+              batchSuccess = true;
+              savedChunksCount += chunkBatch.length;
+            } else {
+              throw new Error(embedData.error || "Błąd zapisu paczki do bazy.");
+            }
           }
-        } catch (err) {
-          failedCount++;
-          fileProcessed = true;
+          // Mikro-pauza między partiami
+          await new Promise(r => setTimeout(r, 1500));
         }
+
+        successCount++;
+        setStatus(`✅ [${i + 1}/${files.length}] Sukces! Wygenerowano aż ${savedChunksCount} ultra-precyzyjnych wektorów dla ${file.name}.`);
+      } catch (err) {
+        console.error(err);
+        failedCount++;
+        setStatus(`❌ Błąd przy pliku ${file.name}: ${err.message}`);
       }
 
       setStats({ current: i + 1, total: files.length, success: successCount, skipped: skippedCount, failed: failedCount });
-      await new Promise((r) => setTimeout(r, 1500)); // Standardowa przerwa między plikami
+      await new Promise((r) => setTimeout(r, 1500)); // Przerwa przed nowym plikiem
     }
 
-    setStatus(`🎉 Zakończono! Zapisano nowych: ${successCount}, Pominięto duplikatów: ${skippedCount}, Błędy: ${failedCount}`);
+    setStatus(`🎉 Zakończono! Zapisano nowych plików: ${successCount}, Pominięto duplikatów: ${skippedCount}, Błędy: ${failedCount}`);
     setIsProcessing(false);
     setFiles([]);
     setTitle('');
