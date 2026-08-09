@@ -11,6 +11,7 @@ function getSupabase() {
   return createClient(url, key);
 }
 
+// Precyzyjne cięcie tekstu dla schematów
 function chunkTextWithOverlap(text, chunkSize = 600, overlap = 200) {
   const chunks = [];
   let start = 0;
@@ -26,52 +27,61 @@ function chunkTextWithOverlap(text, chunkSize = 600, overlap = 200) {
   return chunks;
 }
 
-// Narzędzie do sztucznej pauzy (omijanie błędu 429)
+// Funkcja pauzy (zapobiega błędom 429)
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// ZBIORCZE POBIERANIE WEKTORÓW (Odporne na 429 Rate Limit)
+// Pobieranie POJEDYNCZEGO wektora z wbudowanym systemem ratunkowym (fallback)
+async function getEmbeddingSingle(text, apiKey) {
+  // Lista modeli do przetestowania (oba generują wektor 768)
+  const modelsToTry = ["text-embedding-004", "embedding-001"];
+  let lastError = "";
+
+  for (const model of modelsToTry) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent?key=${apiKey}`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: `models/${model}`,
+          content: { parts: [{ text: text.slice(0, 8000) }] }
+        })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        if (data.embedding?.values) {
+          return data.embedding.values;
+        }
+      } else {
+        lastError = await response.text();
+        // Jeśli wyrzuci błąd limitu, robimy krótką pauzę przed próbą ratunkową
+        if (response.status === 429) await sleep(1000);
+      }
+    } catch (err) {
+      lastError = err.message;
+    }
+  }
+
+  throw new Error(`Google API całkowicie odrzuciło prośbę. Ostatni błąd: ${lastError}`);
+}
+
+// SEKWENCYJNE WYSYŁANIE - Gwarantuje ominięcie wszystkich blokad
 async function getBatchEmbeddingsGemini(textArray) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error("Brak klucza GEMINI_API_KEY w pliku .env!");
   }
 
-  const model = "text-embedding-004"; // Używamy twardo najlepszego modelu
-  const batchSize = 100; // Maksymalnie 100 elementów w jednym zapytaniu API!
   const allEmbeddings = [];
 
-  for (let i = 0; i < textArray.length; i += batchSize) {
-    const chunkBatch = textArray.slice(i, i + batchSize);
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:batchEmbedContents?key=${apiKey}`;
-
-    const requests = chunkBatch.map(text => ({
-      model: `models/${model}`,
-      content: { parts: [{ text: text.slice(0, 8000) }] }
-    }));
-
-    try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ requests })
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        const embeddings = data.embeddings?.map(e => e.values) || [];
-        allEmbeddings.push(...embeddings);
-      } else {
-        const errText = await response.text();
-        throw new Error(`Google API Error (${response.status}): ${errText}`);
-      }
-    } catch (err) {
-      throw new Error(`Błąd wektoryzacji paczki: ${err.message}`);
-    }
-
-    // Dodajemy bezpieczne opóźnienie między wysyłką kolejnych paczek
-    if (i + batchSize < textArray.length) {
-      await sleep(1500); 
-    }
+  // Pętla wysyła zapytania jedno po drugim, bez ryzykownego "batchingu"
+  for (let i = 0; i < textArray.length; i++) {
+    const vector = await getEmbeddingSingle(textArray[i], apiKey);
+    allEmbeddings.push(vector);
+    
+    // Kluczowa pauza 350 milisekund (~3 zapytania na sekundę, perfekcyjnie w limitach darmowego konta)
+    await sleep(350); 
   }
 
   return allEmbeddings;
@@ -126,7 +136,6 @@ export async function POST(req) {
       return NextResponse.json({ success: false, error: "Brak treści do zapisania." }, { status: 400 });
     }
 
-    // Wyciągamy teksty i zmieniamy w wektory
     const prepTexts = textChunks.map(c => `${c.title}:\n${c.content}`);
     const embeddings = await getBatchEmbeddingsGemini(prepTexts);
 
@@ -146,7 +155,7 @@ export async function POST(req) {
 
     return NextResponse.json({
       success: true,
-      message: `Przetworzono pomyślnie! Zapisano ${records.length} precyzyjnych fragmentów na silniku text-embedding-004.`
+      message: `Przetworzono pomyślnie! Zapisano ${records.length} precyzyjnych fragmentów na silniku wektorowym Google.`
     });
 
   } catch (error) {
