@@ -175,4 +175,4 @@ export async function POST(req) {
     console.error("Błąd w trakcie nauki:", error);
     return NextResponse.json({ success: false, error: error.message }, { status: 500 });
   }
-}
+}z
