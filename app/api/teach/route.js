@@ -2,7 +2,7 @@ import { createClient } from '@supabase/supabase-js';
 import { NextResponse } from 'next/server';
 import pdfParse from 'pdf-parse';
 
-export const maxDuration = 60;
+export const maxDuration = 60; // Max dla Vercela (Hobby)
 
 function getSupabase() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -28,7 +28,6 @@ function chunkTextWithOverlap(text, chunkSize = 600, overlap = 200) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// GLOBALNY MAGAZYNEK MODELI WEKTOROWYCH
 let availableModelsCache = [];
 
 async function getAvailableEmbeddingModels(apiKey) {
@@ -47,72 +46,79 @@ async function getAvailableEmbeddingModels(apiKey) {
     console.warn("Błąd pobierania modeli wektorowych.");
   }
 
-  // W razie awarii autodetekcji ładujemy żelazny zapas
   if (availableModelsCache.length === 0) {
-    availableModelsCache = ["text-embedding-004", "embedding-001"];
+    availableModelsCache = ["gemini-embedding-2", "gemini-embedding-1", "embedding-001"];
   }
 
   console.log("🔫 Załadowano magazynek modeli wektorowych:", availableModelsCache);
   return availableModelsCache;
 }
 
-// ROTACYJNE POBIERANIE WEKTORÓW (ROUND-ROBIN)
-async function getEmbeddingsWithRotation(textArray) {
+// PRAWDZIWE WYSYŁANIE ZBIORCZE (BATCHING) + ROTACJA
+async function getBatchEmbeddingsWithRotation(textArray) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error("Brak klucza GEMINI_API_KEY!");
 
   const models = await getAvailableEmbeddingModels(apiKey);
   const allEmbeddings = [];
-  let currentModelIndex = 0; // Wskaźnik rotacji
+  const batchSize = 80; // Wysyłamy po 80 akapitów W JEDNYM STRZALE!
+  let currentModelIndex = 0;
 
-  for (let i = 0; i < textArray.length; i++) {
+  for (let i = 0; i < textArray.length; i += batchSize) {
+    const chunkBatch = textArray.slice(i, i + batchSize);
     let success = false;
     let attempts = 0;
-    const maxAttempts = models.length * 2; // Każdemu modelowi dajemy max 2 szanse na akapit
+    const maxAttempts = models.length * 2; 
 
     while (!success && attempts < maxAttempts) {
       const model = models[currentModelIndex];
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent?key=${apiKey}`;
+      // Używamy endpointu BATCH!
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:batchEmbedContents?key=${apiKey}`;
+
+      const requests = chunkBatch.map(text => ({
+        model: `models/${model}`,
+        content: { parts: [{ text: text.slice(0, 8000) }] }
+      }));
 
       try {
         const response = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: `models/${model}`,
-            content: { parts: [{ text: textArray[i].slice(0, 8000) }] }
-          })
+          body: JSON.stringify({ requests })
         });
 
         if (response.ok) {
           const data = await response.json();
-          allEmbeddings.push(data.embedding.values);
+          const embeddings = data.embeddings?.map(e => e.values) || [];
+          allEmbeddings.push(...embeddings);
           success = true;
+          console.log(`✅ Przetworzono paczkę ${i+1}-${i+chunkBatch.length} (Model: ${model})`);
         } else {
-          // BŁĄD MODELU (np. 429 lub 404) -> PŁYNNA ZMIANA NA KOLEJNY
-          console.warn(`[${model}] zablokowany. Przełączam na kolejny...`);
-          currentModelIndex = (currentModelIndex + 1) % models.length; // Karuzela modeli
+          const errText = await response.text();
+          console.warn(`[${model}] Błąd (np. 429). Przełączam na kolejny model...`);
+          currentModelIndex = (currentModelIndex + 1) % models.length; 
           attempts++;
 
-          // Jeśli przewinęliśmy całą karuzelę i nadal błąd -> robimy chwilę przerwy (chłodzenie lufy)
           if (attempts % models.length === 0) {
-            console.warn("⏳ Wszystkie modele chwilowo zmęczone. Chłodzenie (5 sekund)...");
-            await sleep(5000);
+            console.warn("⏳ Chłodzenie (3 sekundy)...");
+            await sleep(3000);
           }
         }
       } catch (err) {
-        console.warn(`Wyjątek na modelu ${model}: ${err.message}`);
+        console.warn(`[${model}] Wyjątek: ${err.message}`);
         currentModelIndex = (currentModelIndex + 1) % models.length;
         attempts++;
       }
     }
 
     if (!success) {
-      throw new Error(`Wystrzelano magazynek modeli. Zbyt duże obciążenie Google API.`);
+      throw new Error(`Przerwano! Nie udało się przepalić paczki po ${maxAttempts} próbach.`);
     }
 
-    // Bezpieczny odstęp dla API przed kolejnym akapitem
-    await sleep(350);
+    // Krótka pauza tylko między gigantycznymi paczkami
+    if (i + batchSize < textArray.length) {
+      await sleep(1000);
+    }
   }
 
   return allEmbeddings;
@@ -164,8 +170,9 @@ export async function POST(req) {
     if (textChunks.length === 0) return NextResponse.json({ success: false, error: "Brak treści." }, { status: 400 });
 
     const prepTexts = textChunks.map(c => `${c.title}:\n${c.content}`);
-    // Odpalamy naszą maszynkę z rotacją
-    const embeddings = await getEmbeddingsWithRotation(prepTexts);
+    
+    // Używamy wybuchowego batchingu z rotacją modeli!
+    const embeddings = await getBatchEmbeddingsWithRotation(prepTexts);
 
     const records = textChunks.map((chunk, i) => ({
       title: chunk.title,
@@ -179,7 +186,7 @@ export async function POST(req) {
 
     return NextResponse.json({
       success: true,
-      message: `Przetworzono pomyślnie! Zapisano ${records.length} fragmentów przy użyciu rotacji modeli.`
+      message: `Przetworzono pomyślnie! Zapisano ${records.length} fragmentów w ułamku sekundy.`
     });
 
   } catch (error) {
