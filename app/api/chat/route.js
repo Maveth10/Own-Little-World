@@ -11,43 +11,55 @@ function getSupabase() {
   return createClient(url, key);
 }
 
-// NOWY POTĘŻNY SILNIK WEKTORYZUJĄCY: GOOGLE GEMINI
+let cachedChatEmbeddingModel = null;
+
 async function getEmbedding(text) {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    console.warn("Brak GEMINI_API_KEY do wektoryzacji!");
-    return null;
-  }
-
-  // Używamy najnowszego silnika tekstowego Google do Embeddings
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${apiKey}`;
+  if (!apiKey) return null;
 
   try {
+    if (!cachedChatEmbeddingModel) {
+      const listUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
+      const res = await fetch(listUrl, { method: "GET" });
+      if (res.ok) {
+        const data = await res.json();
+        const embedModels = (data.models || [])
+          .filter(m => 
+            m.supportedGenerationMethods?.includes("embedContent") ||
+            m.supportedGenerationMethods?.includes("embedText")
+          )
+          .map(m => m.name.replace("models/", ""));
+
+        if (embedModels.length > 0) {
+          cachedChatEmbeddingModel = embedModels.find(m => m.includes("text-embedding-004")) || embedModels[0];
+        }
+      }
+    }
+
+    const model = cachedChatEmbeddingModel || "text-embedding-004";
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent?key=${apiKey}`;
+    
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: "models/text-embedding-004",
-        content: {
-          parts: [{ text: text.slice(0, 8000) }] // Gemini przyjmuje ogromne porcje tekstu
-        }
+        model: `models/${model}`,
+        content: { parts: [{ text: text.slice(0, 8000) }] }
       })
     });
 
     if (response.ok) {
-      const result = await response.json();
-      return result.embedding?.values || null;
-    } else {
-      const errText = await response.text();
-      console.warn("Błąd Google Embeddings:", errText);
+      const data = await response.json();
+      if (data.embedding?.values) {
+        return data.embedding.values;
+      }
     }
   } catch (err) {
-    console.warn("Wyjątek podczas wektoryzacji na czacie:", err.message);
+    console.warn("Błąd wektoryzacji zapytania czatu:", err.message);
   }
 
   return null;
 }
-
 // -------------------------------------------------------------------------
 // PRE-SKANER OCR (Agentic RAG)
 // -------------------------------------------------------------------------

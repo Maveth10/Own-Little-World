@@ -26,47 +26,72 @@ function chunkTextWithOverlap(text, chunkSize = 600, overlap = 200) {
   return chunks;
 }
 
-// Pojedyncze pobieranie wektora z obsługą modeli zapasowych (odporne na 404)
-async function getEmbeddingSingle(text, apiKey) {
-  const embeddingModels = ["text-embedding-004", "embedding-001"];
-  let lastError = "";
+let cachedEmbeddingModel = null;
 
-  for (const model of embeddingModels) {
-    try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent?key=${apiKey}`;
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: `models/${model}`,
-          content: { parts: [{ text: text.slice(0, 8000) }] }
-        })
-      });
+// Dynamiczne sprawdzanie, który model wektorowy jest aktywny na serwerach Google
+async function getAvailableEmbeddingModel(apiKey) {
+  if (cachedEmbeddingModel) return cachedEmbeddingModel;
 
-      if (response.ok) {
-        const data = await response.json();
-        if (data.embedding?.values) {
-          return data.embedding.values;
-        }
-      } else {
-        lastError = await response.text();
+  try {
+    const listUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
+    const res = await fetch(listUrl, { method: "GET" });
+    if (res.ok) {
+      const data = await res.json();
+      const embedModels = (data.models || [])
+        .filter(m => 
+          m.supportedGenerationMethods?.includes("embedContent") ||
+          m.supportedGenerationMethods?.includes("embedText")
+        )
+        .map(m => m.name.replace("models/", ""));
+
+      if (embedModels.length > 0) {
+        // Preferujemy najnowsze text-embedding-004 lub bierzemy pierwszy z listy
+        const preferred = embedModels.find(m => m.includes("text-embedding-004")) || embedModels[0];
+        cachedEmbeddingModel = preferred;
+        console.log("Wykryto dostępny model wektorowy Google:", cachedEmbeddingModel);
+        return cachedEmbeddingModel;
       }
-    } catch (err) {
-      lastError = err.message;
+    }
+  } catch (err) {
+    console.warn("Nie udało się pobrać listy modeli wektorowych:", err.message);
+  }
+
+  return "text-embedding-004";
+}
+
+// Pobieranie wektora dla pojedynczego fragmentu
+async function getEmbeddingSingle(text, apiKey) {
+  const model = await getAvailableEmbeddingModel(apiKey);
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent?key=${apiKey}`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: `models/${model}`,
+      content: { parts: [{ text: text.slice(0, 8000) }] }
+    })
+  });
+
+  if (response.ok) {
+    const data = await response.json();
+    if (data.embedding?.values) {
+      return data.embedding.values;
     }
   }
 
-  throw new Error(`Google Embeddings Error: ${lastError}`);
+  const errText = await response.text();
+  throw new Error(`Błąd wektoryzacji Google (${model}): ${errText}`);
 }
 
-// Równoległe pobieranie wektorów w małych paczkach
+// Równoległe pobieranie wektorów w paczkach
 async function getBatchEmbeddingsGemini(textArray) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error("Brak klucza GEMINI_API_KEY w pliku .env!");
   }
 
-  const batchSize = 10; // Przetwarzamy po 10 fragmentów równolegle
+  const batchSize = 10;
   const allEmbeddings = [];
 
   for (let i = 0; i < textArray.length; i += batchSize) {
@@ -97,7 +122,9 @@ export async function POST(req) {
     if (isPdf) {
       const pdfRes = await fetch(fileUrl);
       if (!pdfRes.ok) throw new Error("Nie udało się pobrać pliku PDF z magazynu Supabase.");
-      const buffer = Buffer.from(await pdfRes.arrayBuffer());
+      
+      const arrayBuffer = await pdfRes.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
 
       const pdfData = await pdfParse(buffer);
       const extractedText = pdfData.text || "";
