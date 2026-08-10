@@ -20,7 +20,6 @@ export default function TeachAI() {
   const [status, setStatus] = useState('');
   const [stats, setStats] = useState({ current: 0, total: 0, success: 0, skipped: 0, failed: 0 });
 
-  // FUNKCJA: TWARDY RESET BAZY I PLIKÓW
   const handleHardReset = async () => {
     if (!window.confirm("🚨 UWAGA: To bezpowrotnie usunie WSZYSTKIE schematy z bazy wektorowej oraz fizyczne pliki PDF z Supabase. Jesteś pewien?")) return;
 
@@ -46,7 +45,6 @@ export default function TeachAI() {
     }
   };
 
-  // Rekursywne skanowanie folderów i plików w Drag & Drop
   const scanEntry = async (entry) => {
     if (entry.isFile) {
       return new Promise((resolve) => {
@@ -63,7 +61,6 @@ export default function TeachAI() {
     return [];
   };
 
-  // Obsługa upuszczenia plików/folderów na boks (Drag & Drop)
   const handleDrop = async (e) => {
     e.preventDefault();
     setIsDragging(false);
@@ -92,7 +89,6 @@ export default function TeachAI() {
     setStatus(`📁 Wykryto i dodano ${validFiles.length} prawidłowych plików.`);
   };
 
-  // Obsługa tradycyjnego wyboru przez okno plików/folderów
   const handleFileSelection = (e) => {
     if (e.target.files) {
       const selected = Array.from(e.target.files).filter(
@@ -116,22 +112,28 @@ export default function TeachAI() {
     setIsProcessing(true);
     const supabase = getSupabase();
 
-    // DLA SAMESO TEKSTU
     if (files.length === 0) {
       setStatus('⏳ Przetwarzanie notatki tekstowej...');
       try {
         const res = await fetch('/api/teach', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ title, content }),
+          body: JSON.stringify({ action: 'parse', title, content }), 
         });
-        const data = await res.json();
-        if (data.success) {
-          setStatus(`✅ Sukces! ${data.message}`);
-          setTitle('');
-          setContent('');
-        } else {
-          setStatus('❌ Błąd API: ' + data.error);
+        const parseData = await res.json();
+        if (parseData.success && parseData.chunks) {
+           const embedRes = await fetch('/api/teach', {
+             method: 'POST',
+             headers: { 'Content-Type': 'application/json' },
+             body: JSON.stringify({ action: 'embed', chunks: parseData.chunks }),
+           });
+           const embedData = await embedRes.json();
+           if (embedData.success) {
+             setStatus(`✅ Sukces! Zapisano notatkę.`);
+             setTitle(''); setContent('');
+           } else {
+             setStatus('❌ Błąd wektoryzacji: ' + (embedData.error || 'Nieznany błąd'));
+           }
         }
       } catch (err) {
         setStatus('❌ Błąd wysyłania notatki.');
@@ -140,7 +142,6 @@ export default function TeachAI() {
       return;
     }
 
-    // MASOWA OBSŁUGA PLIKÓW/FOLDERÓW
     setStatus('🔍 Pobieranie listy plików z bazy do sprawdzenia duplikatów...');
     let existingStorageFiles = [];
     try {
@@ -153,6 +154,9 @@ export default function TeachAI() {
     let successCount = 0;
     let skippedCount = 0;
     let failedCount = 0;
+    
+    // TABLICA DO PRZECHOWYWANIA BŁĘDÓW!
+    let detailedErrors = []; 
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
@@ -167,7 +171,6 @@ export default function TeachAI() {
       }
 
       try {
-        // KROK 1: UPLOAD (Wykona się TYLKO RAZ)
         setStatus(`⏳ [${i + 1}/${files.length}] Krok 1/3: Wgrywanie pliku ${file.name} do Supabase...`);
         const fileName = `${Date.now()}_${safeName}`;
         const fileType = file.type || (file.name.endsWith('.pdf') ? 'application/pdf' : 'image/jpeg');
@@ -178,7 +181,6 @@ export default function TeachAI() {
         const fileUrl = supabase.storage.from('schematics').getPublicUrl(fileName).data.publicUrl;
         existingStorageFiles.push(fileName.toLowerCase());
 
-        // KROK 2: PARSOWANIE (Tniemy PDF na tysiące kawałków)
         setStatus(`🔍 [${i + 1}/${files.length}] Krok 2/3: Odczytywanie i cięcie tekstu z PDF...`);
         const parseRes = await fetch('/api/teach', {
           method: 'POST',
@@ -190,15 +192,13 @@ export default function TeachAI() {
         if (!parseData.success || !parseData.chunks) throw new Error(parseData.error || "Błąd parsowania PDF.");
 
         const allChunks = parseData.chunks;
-        
-        // KROK 3: STRUMIENIOWANIE WEKTORÓW (Odporne na wszystko)
         const batchSize = 50;
         let savedChunksCount = 0;
 
         for (let j = 0; j < allChunks.length; j += batchSize) {
           const chunkBatch = allChunks.slice(j, j + batchSize);
           let batchSuccess = false;
-          let waitTime = 60; // 60 sekund pauzy na wypadek 429
+          let waitTime = 60; 
 
           while (!batchSuccess) {
             setStatus(`🧠 [${i + 1}/${files.length}] Krok 3/3: Wektoryzacja paczki ${j+1}-${Math.min(j+batchSize, allChunks.length)} / ${allChunks.length} z pliku ${file.name}...`);
@@ -210,26 +210,24 @@ export default function TeachAI() {
             });
 
             if (embedRes.status === 429) {
-              // Zmęczenie materiału? Czekamy i ponawiamy TYLKO TĘ paczkę!
               for (let s = waitTime; s > 0; s--) {
                 setStatus(`⏸️ Limit API Google. Pauza: ${s} sek. (Partia ${j+1}-${Math.min(j+batchSize, allChunks.length)} / ${allChunks.length})`);
                 await new Promise(r => setTimeout(r, 1000));
               }
-              waitTime += 15; // wydłużamy kolejną przerwę gdyby nie pomogło
+              waitTime += 15; 
               continue; 
             }
 
-            if (!embedRes.ok) throw new Error("Błąd podczas wektoryzacji paczki.");
-
+            // ODCZYTUJEMY BŁĄD PROSTO Z SERWERA!
             const embedData = await embedRes.json();
-            if (embedData.success) {
-              batchSuccess = true;
-              savedChunksCount += chunkBatch.length;
-            } else {
-              throw new Error(embedData.error || "Błąd zapisu paczki do bazy.");
+            
+            if (!embedRes.ok || !embedData.success) {
+              throw new Error(embedData.error || `Błąd serwera: Kod ${embedRes.status}`);
             }
+
+            batchSuccess = true;
+            savedChunksCount += chunkBatch.length;
           }
-          // Mikro-pauza między partiami
           await new Promise(r => setTimeout(r, 1500));
         }
 
@@ -238,14 +236,20 @@ export default function TeachAI() {
       } catch (err) {
         console.error(err);
         failedCount++;
-        setStatus(`❌ Błąd przy pliku ${file.name}: ${err.message}`);
+        detailedErrors.push(`Plik ${file.name}: ${err.message}`); // Zapisujemy dokładny powód porażki
       }
 
       setStats({ current: i + 1, total: files.length, success: successCount, skipped: skippedCount, failed: failedCount });
-      await new Promise((r) => setTimeout(r, 1500)); // Przerwa przed nowym plikiem
+      await new Promise((r) => setTimeout(r, 1500)); 
     }
 
-    setStatus(`🎉 Zakończono! Zapisano nowych plików: ${successCount}, Pominięto duplikatów: ${skippedCount}, Błędy: ${failedCount}`);
+    // WYŚWIETLAMY WSZYSTKIE BŁĘDY NA EKRANIE, ŻEBY ICH NIE ZATAJAĆ!
+    if (detailedErrors.length > 0) {
+      setStatus(`⚠️ Proces zakończony z błędami! Zapisano: ${successCount}, Błędy: ${failedCount}. Szczegóły:\n${detailedErrors.join('\n')}`);
+    } else {
+      setStatus(`🎉 Zakończono! Zapisano nowych plików: ${successCount}, Pominięto duplikatów: ${skippedCount}, Błędy: ${failedCount}`);
+    }
+    
     setIsProcessing(false);
     setFiles([]);
     setTitle('');
@@ -257,7 +261,6 @@ export default function TeachAI() {
       <div className="flex justify-between items-start mb-2">
         <h1 className="text-3xl font-bold">Panel Głównego Inżyniera</h1>
         
-        {/* PRZYCISK CZYSZCZENIA BAZY */}
         <button
           onClick={handleHardReset}
           disabled={isProcessing}
@@ -291,7 +294,6 @@ export default function TeachAI() {
           className="p-3 border border-gray-300 rounded-lg h-24 focus:ring-2 focus:ring-yellow-400 outline-none"
         />
 
-        {/* INTELIGENTNY BOKS ZRZUTU (SMART DROPZONE) */}
         <div
           onDragOver={(e) => {
             e.preventDefault();
@@ -343,7 +345,6 @@ export default function TeachAI() {
           </div>
         </div>
 
-        {/* LISTA PODGLĄDU PLIKÓW */}
         {files.length > 0 && (
           <div className="p-4 bg-gray-100 rounded-xl border border-gray-200">
             <div className="flex justify-between items-center mb-2">
@@ -373,7 +374,6 @@ export default function TeachAI() {
           </div>
         )}
 
-        {/* PRZYCISK URUCHOMIENIA */}
         <button
           onClick={handleBatchSave}
           disabled={isProcessing || (files.length === 0 && !title && !content)}
@@ -389,11 +389,10 @@ export default function TeachAI() {
           )}
         </button>
 
-        {/* STATUS */}
         {status && (
           <div
-            className={`mt-2 font-bold text-center text-base p-4 rounded-lg border ${
-              status.includes('❌')
+            className={`mt-2 font-bold text-center text-base p-4 rounded-lg border whitespace-pre-wrap ${
+              status.includes('❌') || status.includes('⚠️')
                 ? 'bg-red-50 text-red-800 border-red-200'
                 : status.includes('🎉') || status.includes('✅')
                 ? 'bg-green-50 text-green-800 border-green-200'
