@@ -116,7 +116,9 @@ export async function POST(req) {
       }
 
       const data = await response.json();
-      const embeddings = data.embeddings?.map(e => e.values) || [];
+      
+      // KLUCZOWA POPRAWKA: Tniemy wektor (np. z 3072) w locie, by miał równe 768 wymiarów!
+      const embeddings = data.embeddings?.map(e => e.values.slice(0, 768)) || [];
 
       if (embeddings.length !== chunks.length) throw new Error("Wektory nie zgadzają się z ilością tekstu.");
 
