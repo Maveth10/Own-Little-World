@@ -122,11 +122,13 @@ export async function POST(req) {
 
       if (embeddings.length !== chunks.length) throw new Error("Wektory nie zgadzają się z ilością tekstu.");
 
+      // DODANA HYBRYDOWA WSTAWKA METADATA DO BAZY
       const records = chunks.map((chunk, i) => ({
         title: chunk.title,
         content: chunk.content,
         embedding: embeddings[i],
-        image_url: chunk.image_url
+        image_url: chunk.image_url,
+        metadata: { source: "web_panel", file_size: 0 } 
       }));
 
       // ZAPIS W BAZIE!

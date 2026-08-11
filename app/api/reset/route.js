@@ -13,6 +13,7 @@ export async function POST() {
     const supabase = createClient(supabaseUrl, supabaseKey);
 
     // 1. ZEROWANIE PAMIĘCI AI
+    // Omija zmiany w schemacie (nowe kolumny) - po prostu "orze" całą tabelę do zera
     const { error: dbError } = await supabase
       .from('ai_memory')
       .delete()

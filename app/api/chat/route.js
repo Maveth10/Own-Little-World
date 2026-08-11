@@ -29,7 +29,8 @@ async function getEmbedding(text) {
           .map(m => m.name.replace("models/", ""));
       }
     } catch (e) {}
-    if (embedModelsCache.length === 0) embedModelsCache = ["text-embedding-004", "embedding-001"];
+    // Zawsze preferujemy najnowsze modele na start
+    if (embedModelsCache.length === 0) embedModelsCache = ["gemini-embedding-2", "text-embedding-004", "embedding-001"];
   }
 
   // Rotacyjna próba wyciągnięcia wektora na czacie
@@ -52,7 +53,8 @@ async function getEmbedding(text) {
           // Jeśli model zadziałał, wrzucamy go na pierwsze miejsce w kolejce, by używać go domyślnie
           embedModelsCache.splice(i, 1);
           embedModelsCache.unshift(model);
-          return data.embedding.values;
+          // KLUCZOWE: Tniemy wektor pytania do 768 wymiarów, by zrównał się ze strukturą bazy danych!
+          return data.embedding.values.slice(0, 768);
         }
       }
     } catch (err) {
@@ -62,6 +64,7 @@ async function getEmbedding(text) {
 
   return null;
 }
+
 // -------------------------------------------------------------------------
 // PRE-SKANER OCR (Agentic RAG)
 // -------------------------------------------------------------------------
@@ -227,8 +230,6 @@ export async function POST(req) {
 
     // -------------------------------------------------------------------------
     // KROK 1: ŚCISŁE WYSZUKIWANIE REGEX (STRICT MATCH) PRZED WEKTORAMI
-    // Zapobiega halucynacjom podobnych modeli. Jeśli znajdzie ścisły wzorzec, ciągnie 
-    // surowe dane tekstowe na siłę.
     // -------------------------------------------------------------------------
     const explicitRegex = /(3-\d+-\d+\.\d+|[Gg]\d+-\d+(-\d+)?)/g;
     const explicitMatches = enhancedSearchQuery.match(explicitRegex);
@@ -242,9 +243,8 @@ export async function POST(req) {
           const { data: strictResults } = await supabase
             .from('ai_memory')
             .select('*')
-            // Używamy "ilike" do twardego szukania ciągu znaków w tytule lub tekście, omijając algorytm wektorowy
             .or(`title.ilike.%${exactMatch}%,content.ilike.%${exactMatch}%`)
-            .limit(10); // Pobierz top 10 najlepszych dokładnych trafień dla tego konkretnego modelu
+            .limit(10); 
 
           if (strictResults && strictResults.length > 0) {
             contextChunks.push(...strictResults);
@@ -257,7 +257,6 @@ export async function POST(req) {
 
     // -------------------------------------------------------------------------
     // KROK 2: UZUPEŁNIAJĄCE WYSZUKIWANIE WEKTOROWE I TEKSTOWE
-    // Szukamy pojęć kontekstowych (np. "schematy powiązane", "zasilanie", "komunikacja")
     // -------------------------------------------------------------------------
     const queryEmbedding = await getEmbedding(enhancedSearchQuery);
 
@@ -299,7 +298,7 @@ export async function POST(req) {
     }
 
     // -------------------------------------------------------------------------
-    // KROK 3: MULTI-HOP RAG (Dociąganie plików PDF na podstawie znalezionego kontekstu)
+    // KROK 3: MULTI-HOP RAG (Dociąganie plików PDF)
     // -------------------------------------------------------------------------
     const foundSymbols = new Set();
     contextChunks.forEach(chunk => {
@@ -311,7 +310,7 @@ export async function POST(req) {
     });
 
     if (foundSymbols.size > 0) {
-      console.log("🔄 [Multi-Hop RAG] Dociągam powiązane moduły/pliki:", Array.from(foundSymbols).slice(0, 10)); // max 10 symboli żeby nie zabić bazy
+      console.log("🔄 [Multi-Hop RAG] Dociągam powiązane moduły/pliki:", Array.from(foundSymbols).slice(0, 10)); 
       for (const symbol of Array.from(foundSymbols).slice(0, 10)) {
         try {
           const { data: extraResults } = await supabase
@@ -347,7 +346,9 @@ export async function POST(req) {
       contextText += `\nLINKI DO SCHEMATÓW PDF POBRANE Z BAZY (UŻYWAJ ICH DO PRZYCISKÓW):\n` + Array.from(pdfLinks).map(url => `- ${url}`).join('\n') + `\n`;
     }
 
-    // ZMODYFIKOWANY SYSTEM PROMPT WYMUSZAJĄCY KORZYSTANIE Z DANYCH Z BAZY
+    // -------------------------------------------------------------------------
+    // SYSTEM PROMPT
+    // -------------------------------------------------------------------------
     const systemPrompt = `Jesteś Głównym Inżynierem Wsparcia Zdalnego w Axon AI. Pomagasz technikom w terenie.
 
     TWOJA WIEDZA I ZAKRES DZIAŁANIA:
