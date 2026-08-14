@@ -32,12 +32,17 @@ async function getAvailableEmbeddingModels(apiKey) {
       const data = await res.json();
       const models = (data.models || [])
         .filter(m => m.supportedGenerationMethods?.includes("embedContent"))
-        .map(m => m.name.replace("models/", ""));
+        .map(m => m.name.replace("models/", ""))
+        .sort()
+        .reverse(); // Zmusza do wzięcia najnowszej generacji (np. gemini-embedding-2-preview)
       if (models.length > 0) return models;
     }
-  } catch (e) {}
-  return ["gemini-embedding-2", "embedding-001"];
-}
+  } catch (e) {
+    console.error("Błąd pobierania modeli:", e);
+  }
+  // Fallback na najnowszy znany nam model
+  return ["gemini-embedding-2-preview", "embedding-001"];
+}s
 
 export async function POST(req) {
   try {
