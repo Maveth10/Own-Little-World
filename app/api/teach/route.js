@@ -42,7 +42,7 @@ async function getAvailableEmbeddingModels(apiKey) {
   }
   // Fallback na najnowszy znany nam model
   return ["gemini-embedding-2-preview", "embedding-001"];
-}s
+}
 
 export async function POST(req) {
   try {
