@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useRef, useEffect } from 'react';
-import { Send, Upload, Camera, Bot, Trash2, Plus, Mic, MicOff, X, FileImage } from 'lucide-react';
+import { Send, Camera, Bot, Trash2, Plus, Mic, MicOff, X, Paperclip, BookOpen } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
@@ -231,8 +231,8 @@ export default function AxonAI() {
   if (!isClient) return <div className="h-screen bg-gray-100 flex items-center justify-center font-bold">Ładowanie systemu...</div>;
 
   return (
-    <div className="flex flex-col h-screen bg-gray-100 font-sans text-gray-900">
-      <header className="bg-white border-b-4 border-yellow-400 p-4 text-center shadow-sm shrink-0 relative flex items-center justify-between px-4 md:px-8">
+    <div className="flex flex-col h-screen bg-gray-100 font-sans text-gray-900 relative">
+      <header className="bg-white border-b-4 border-yellow-400 p-4 text-center shadow-sm shrink-0 relative flex items-center justify-between px-4 md:px-8 z-10">
         <div className="flex items-center gap-2">
           <Bot className="text-yellow-500" size={28} />
           <div className="text-left">
@@ -251,7 +251,7 @@ export default function AxonAI() {
         </button>
       </header>
 
-      <div className="flex-1 overflow-y-auto p-4 md:p-8 space-y-6">
+      <div className="flex-1 overflow-y-auto p-4 md:p-8 space-y-6 z-0">
         {messages.map((msg, idx) => (
           <div key={idx} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
             {msg.role === 'sys' ? (
@@ -306,21 +306,21 @@ export default function AxonAI() {
         <div ref={messagesEndRef} />
       </div>
 
-      <div className="bg-white p-3 md:p-4 border-t border-gray-200 shadow-lg shrink-0 relative">
+      <div className="bg-white p-3 md:p-4 border-t border-gray-200 shadow-[0_-4px_20px_rgba(0,0,0,0.05)] shrink-0 relative z-20">
         
         {/* PODGLĄD ZDJĘCIA PRZED WYSŁANIEM */}
         {imagePreview && (
-          <div className="max-w-4xl mx-auto mb-3 flex items-center gap-3 bg-gray-50 p-2 rounded-xl border border-gray-200 w-fit relative group">
+          <div className="max-w-4xl mx-auto mb-3 flex items-center gap-3 bg-gray-50 p-2 rounded-xl border border-gray-200 w-fit relative group shadow-sm">
             <img src={imagePreview} alt="Podgląd" className="w-14 h-14 object-cover rounded-lg border border-gray-300" />
             <div className="pr-6">
               <p className="text-xs font-bold text-gray-800 truncate max-w-[200px]">{image?.name || 'Obraz ze schowka'}</p>
-              <p className="text-[10px] text-green-600 font-semibold">Ready do analizy AI</p>
+              <p className="text-[10px] text-green-600 font-semibold">Gotowe do analizy wizyjnej</p>
             </div>
             <button 
               onClick={removeSelectedImage}
-              className="absolute -top-2 -right-2 bg-red-500 hover:bg-red-600 text-white p-1 rounded-full shadow-md transition-colors"
+              className="absolute -top-2 -right-2 bg-gray-800 hover:bg-red-500 text-white p-1 rounded-full shadow-md transition-colors border border-white"
             >
-              <X size={14} />
+              <X size={12} />
             </button>
           </div>
         )}
@@ -344,24 +344,41 @@ export default function AxonAI() {
           disabled={loading} 
         />
 
-        {/* ROZWIJANE MENU PLUSIKA (+) */}
+        {/* ROZWIJANE MENU W STYLU GEMINI (Ciemny motyw) */}
         {showPlusMenu && (
-          <div className="absolute bottom-20 left-4 md:left-auto bg-white border border-gray-200 rounded-2xl shadow-xl p-2 z-50 flex flex-col gap-1 w-52 animate-in fade-in slide-in-from-bottom-2">
-            <button
-              onClick={() => cameraInputRef.current?.click()}
-              className="flex items-center gap-3 p-2.5 hover:bg-yellow-50 text-gray-800 rounded-xl transition-colors font-medium text-xs text-left"
-            >
-              <div className="p-2 bg-yellow-100 text-yellow-700 rounded-lg"><Camera size={16} /></div>
-              <span>Zrób zdjęcie (Aparat)</span>
-            </button>
-            <button
-              onClick={() => galleryInputRef.current?.click()}
-              className="flex items-center gap-3 p-2.5 hover:bg-yellow-50 text-gray-800 rounded-xl transition-colors font-medium text-xs text-left"
-            >
-              <div className="p-2 bg-blue-100 text-blue-700 rounded-lg"><FileImage size={16} /></div>
-              <span>Wybierz z galerii / plik</span>
-            </button>
-          </div>
+          <>
+            {/* Niewidzialna warstwa zamykająca menu przy kliknięciu w tło */}
+            <div className="fixed inset-0 z-40" onClick={() => setShowPlusMenu(false)}></div>
+            
+            <div className="absolute bottom-20 left-4 md:left-auto bg-[#1e1e1e] text-gray-200 border border-gray-700 rounded-2xl shadow-2xl py-2 z-50 flex flex-col w-64 animate-in fade-in slide-in-from-bottom-2 font-medium">
+              
+              <button
+                onClick={() => { galleryInputRef.current?.click(); setShowPlusMenu(false); }}
+                className="flex items-center gap-4 px-4 py-3 hover:bg-white/10 transition-colors text-sm text-left"
+              >
+                <Paperclip size={18} className="text-gray-400" />
+                <span>Prześlij pliki z Galerii</span>
+              </button>
+
+              <button
+                onClick={() => { cameraInputRef.current?.click(); setShowPlusMenu(false); }}
+                className="flex items-center gap-4 px-4 py-3 hover:bg-white/10 transition-colors text-sm text-left"
+              >
+                <Camera size={18} className="text-gray-400" />
+                <span>Zrób zdjęcie (Aparat)</span>
+              </button>
+
+              <div className="h-px bg-gray-700 my-1 mx-4" />
+
+              <button
+                onClick={() => window.location.href = '/teach'}
+                className="flex items-center gap-4 px-4 py-3 hover:bg-white/10 transition-colors text-sm text-left"
+              >
+                <BookOpen size={18} className="text-gray-400" />
+                <span>Tryb nauki (Wgraj schemat)</span>
+              </button>
+            </div>
+          </>
         )}
 
         <div className="max-w-4xl mx-auto flex items-center gap-2">
@@ -370,11 +387,11 @@ export default function AxonAI() {
           <button
             onClick={() => setShowPlusMenu(!showPlusMenu)}
             disabled={loading}
-            className={`p-3 rounded-xl transition-colors border flex items-center justify-center shrink-0 ${
-              showPlusMenu ? 'bg-yellow-400 text-black border-yellow-500' : 'bg-gray-100 hover:bg-gray-200 text-gray-700 border-gray-300'
+            className={`p-3 rounded-full transition-colors flex items-center justify-center shrink-0 ${
+              showPlusMenu ? 'bg-gray-200 text-gray-900 rotate-45' : 'bg-gray-100 hover:bg-gray-200 text-gray-700'
             }`}
           >
-            <Plus size={20} className={showPlusMenu ? 'rotate-45 transition-transform' : 'transition-transform'} />
+            <Plus size={22} className="transition-transform duration-200" />
           </button>
 
           {/* INPUT TEKSTOWY */}
@@ -385,9 +402,9 @@ export default function AxonAI() {
             onKeyDown={(e) => e.key === 'Enter' && handleSend()}
             onPaste={handlePaste} 
             disabled={loading}
-            placeholder={isListening ? 'Słucham... dyktuj teraz...' : 'Zapytaj lub wklej wycinek (Ctrl+V)...'}
-            className={`flex-1 p-3 bg-white text-gray-900 placeholder-gray-400 border rounded-xl focus:outline-none focus:border-yellow-400 focus:ring-2 focus:ring-yellow-400 transition-all font-medium text-sm md:text-base ${
-              isListening ? 'border-red-400 ring-2 ring-red-300' : 'border-gray-300'
+            placeholder={isListening ? 'Słucham... dyktuj teraz...' : 'Zapytaj AI lub wklej (Ctrl+V)...'}
+            className={`flex-1 p-3 bg-gray-100 text-gray-900 placeholder-gray-500 rounded-2xl border-none focus:outline-none focus:ring-2 focus:ring-gray-300 transition-all font-medium text-sm md:text-base ${
+              isListening ? 'bg-red-50 text-red-900 placeholder-red-400 ring-2 ring-red-300' : ''
             }`}
           />
 
@@ -396,23 +413,22 @@ export default function AxonAI() {
             onClick={toggleListening}
             disabled={loading}
             title={isListening ? 'Zatrzymaj dyktowanie' : 'Dyktuj mowę'}
-            className={`p-3 rounded-xl transition-colors border flex items-center justify-center shrink-0 ${
+            className={`p-3 rounded-full transition-colors flex items-center justify-center shrink-0 ${
               isListening 
-                ? 'bg-red-500 text-white border-red-600 animate-pulse' 
-                : 'bg-gray-100 hover:bg-gray-200 text-gray-700 border-gray-300'
+                ? 'bg-red-500 text-white animate-pulse shadow-md' 
+                : 'bg-gray-100 hover:bg-gray-200 text-gray-700'
             }`}
           >
-            {isListening ? <MicOff size={20} /> : <Mic size={20} />}
+            {isListening ? <MicOff size={22} /> : <Mic size={22} />}
           </button>
 
           {/* PRZYCISK WYSŁANIA */}
           <button 
             onClick={handleSend} 
             disabled={(!input.trim() && !image) || loading} 
-            className="p-3 bg-yellow-400 hover:bg-yellow-500 disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed text-black font-bold rounded-xl transition-colors flex items-center gap-2 shadow-sm shrink-0"
+            className="p-3 bg-gray-900 hover:bg-black disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed text-white font-bold rounded-full transition-colors flex items-center justify-center shrink-0 shadow-sm"
           >
-            <Send size={20} />
-            <span className="hidden sm:inline uppercase text-xs tracking-wider">Wyślij</span>
+            <Send size={20} className="ml-1" />
           </button>
         </div>
       </div>
