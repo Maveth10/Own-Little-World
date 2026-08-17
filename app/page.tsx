@@ -1,23 +1,29 @@
 'use client';
 
 import { useState, useRef, useEffect } from 'react';
-import { Send, Upload, Camera, Bot, Trash2 } from 'lucide-react';
+import { Send, Upload, Camera, Bot, Trash2, Plus, Mic, MicOff, X, FileImage } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
 export default function AxonAI() {
   const defaultMessage = {
     role: 'ai',
-    text: 'Witaj! Jestem głównym inżynierem Axon AI. Opisz problem, podaj symbol stacji lub wklej (Ctrl+V) zrzut ekranu ze schematu.',
+    text: 'Witaj! Jestem głównym inżynierem Axon AI. Opisz problem, podaj symbol stacji, zrób zdjęcie aparatem lub wklej (Ctrl+V) zrzut ekranu ze schematu.',
   };
 
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [image, setImage] = useState(null);
+  const [imagePreview, setImagePreview] = useState(null);
   const [loading, setLoading] = useState(false);
   const [isClient, setIsClient] = useState(false);
+  const [showPlusMenu, setShowPlusMenu] = useState(false);
+  const [isListening, setIsListening] = useState(false);
 
   const messagesEndRef = useRef(null);
+  const galleryInputRef = useRef(null);
+  const cameraInputRef = useRef(null);
+  const recognitionRef = useRef(null);
 
   useEffect(() => {
     setIsClient(true);
@@ -31,6 +37,36 @@ export default function AxonAI() {
     } else {
       setMessages([defaultMessage]);
     }
+
+    // Inicjalizacja rozpoznawania mowy (Web Speech API)
+    if (typeof window !== 'undefined') {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (SpeechRecognition) {
+        const recognition = new SpeechRecognition();
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.lang = 'pl-PL';
+
+        recognition.onresult = (event) => {
+          let currentTranscript = '';
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            currentTranscript += event.results[i][0].transcript;
+          }
+          setInput((prev) => (prev ? `${prev} ${currentTranscript}` : currentTranscript));
+        };
+
+        recognition.onerror = (err) => {
+          console.warn("Błąd rozpoznawania mowy:", err);
+          setIsListening(false);
+        };
+
+        recognition.onend = () => {
+          setIsListening(false);
+        };
+
+        recognitionRef.current = recognition;
+      }
+    }
   }, []);
 
   useEffect(() => {
@@ -40,20 +76,25 @@ export default function AxonAI() {
     }
   }, [messages, isClient]);
 
-  const handleClearHistory = () => {
-    if (window.confirm('Czy na pewno chcesz wyczyścić historię czatu?')) {
-      setMessages([defaultMessage]);
-      localStorage.removeItem('axon_chat_history');
-    }
-  };
-
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  // Obsługa podglądu obrazka przy wyborze/wklejeniu
+  const handleSetImage = (file) => {
+    if (!file) return;
+    setImage(file);
+    const reader = new FileReader();
+    reader.onload = () => {
+      setImagePreview(reader.result);
+    };
+    reader.readAsDataURL(file);
+  };
+
   const handleImageUpload = (e) => {
     const file = e.target.files ? e.target.files[0] : null;
-    if (file) setImage(file);
+    if (file) handleSetImage(file);
+    setShowPlusMenu(false);
   };
 
   const handlePaste = (e) => {
@@ -65,25 +106,50 @@ export default function AxonAI() {
         const file = items[i].getAsFile();
         if (file) {
           const timestamp = new Date().toLocaleTimeString().replace(/:/g, '-');
-          setImage(new File([file], `Wklejony_zrzut_${timestamp}.png`, { type: file.type }));
+          handleSetImage(new File([file], `Wklejony_zrzut_${timestamp}.png`, { type: file.type }));
           break;
         }
       }
     }
   };
 
+  const toggleListening = () => {
+    if (!recognitionRef.current) {
+      alert("Twoja przeglądarka nie obsługuje dyktowania mowy.");
+      return;
+    }
+
+    if (isListening) {
+      recognitionRef.current.stop();
+      setIsListening(false);
+    } else {
+      recognitionRef.current.start();
+      setIsListening(true);
+    }
+  };
+
+  const removeSelectedImage = () => {
+    setImage(null);
+    setImagePreview(null);
+  };
+
   const handleSend = async () => {
     if ((!input.trim() && !image) || loading) return;
 
+    if (isListening && recognitionRef.current) {
+      recognitionRef.current.stop();
+      setIsListening(false);
+    }
+
     const currentInput = input;
     const currentImage = image;
+    const currentPreview = imagePreview;
 
     let base64Image = null;
     let mimeType = null;
 
-    // KROK KLUCZOWY: Konwersja obrazu na format czytelny dla API (Base64)
     if (currentImage) {
-      const fullBase64 = await new Promise((resolve) => {
+      const fullBase64 = currentPreview || await new Promise((resolve) => {
         const reader = new FileReader();
         reader.onload = () => resolve(reader.result);
         reader.readAsDataURL(currentImage);
@@ -92,11 +158,11 @@ export default function AxonAI() {
       mimeType = currentImage.type;
     }
 
-    // Zapisujemy w stanie, aby bot pamiętał zdjęcie w historii rozmowy
     const userMsgForState = {
       role: 'user',
       text: currentInput,
-      image: currentImage?.name,
+      imageName: currentImage?.name,
+      imagePreview: currentPreview,
       base64Image,
       mimeType
     };
@@ -104,6 +170,7 @@ export default function AxonAI() {
     setMessages((prev) => [...prev, userMsgForState]);
     setInput('');
     setImage(null);
+    setImagePreview(null);
     setLoading(true);
 
     setMessages((prev) => [
@@ -112,7 +179,6 @@ export default function AxonAI() {
     ]);
 
     try {
-      // Przygotowanie historii rozmowy (wraz ze zdjęciami) dla API Google
       const historyForApi = messages
         .filter((m) => m.role === 'user' || m.role === 'ai')
         .map((m) => {
@@ -155,21 +221,33 @@ export default function AxonAI() {
     }
   };
 
-  if (!isClient) return <div className="h-screen bg-gray-100 flex items-center justify-center">Ładowanie systemu...</div>;
+  const handleClearHistory = () => {
+    if (window.confirm('Czy na pewno chcesz wyczyścić historię czatu?')) {
+      setMessages([defaultMessage]);
+      localStorage.removeItem('axon_chat_history');
+    }
+  };
+
+  if (!isClient) return <div className="h-screen bg-gray-100 flex items-center justify-center font-bold">Ładowanie systemu...</div>;
 
   return (
     <div className="flex flex-col h-screen bg-gray-100 font-sans text-gray-900">
-      <header className="bg-white border-b-4 border-yellow-400 p-5 text-center shadow-sm shrink-0 relative">
-        <h1 className="text-2xl font-black uppercase tracking-widest text-gray-900 flex items-center justify-center gap-2">
-          <Bot className="text-yellow-500" size={28} /> Robocop Axon AI
-        </h1>
-        <p className="text-xs text-gray-500 mt-1 font-medium">Wyszukiwanie schematów | Analiza Obrazu | Markdown</p>
-        
+      <header className="bg-white border-b-4 border-yellow-400 p-4 text-center shadow-sm shrink-0 relative flex items-center justify-between px-4 md:px-8">
+        <div className="flex items-center gap-2">
+          <Bot className="text-yellow-500" size={28} />
+          <div className="text-left">
+            <h1 className="text-lg md:text-xl font-black uppercase tracking-wider text-gray-900 leading-none">
+              Robocop Axon AI
+            </h1>
+            <p className="text-[10px] md:text-xs text-gray-500 font-medium mt-0.5">Wsparcie Techniczne w Terenie</p>
+          </div>
+        </div>
+
         <button 
           onClick={handleClearHistory}
-          className="absolute right-4 top-1/2 -translate-y-1/2 flex items-center gap-1 px-3 py-1.5 bg-red-50 text-red-600 hover:bg-red-100 hover:text-red-700 font-bold text-xs rounded-md transition-colors border border-red-200"
+          className="flex items-center gap-1 px-3 py-1.5 bg-red-50 text-red-600 hover:bg-red-100 font-bold text-xs rounded-lg transition-colors border border-red-200"
         >
-          <Trash2 size={14} /> Wyczyść czat
+          <Trash2 size={14} /> <span className="hidden sm:inline">Wyczyść</span>
         </button>
       </header>
 
@@ -181,13 +259,21 @@ export default function AxonAI() {
                 ⏳ {msg.text}
               </div>
             ) : (
-              <div className={`max-w-[90%] md:max-w-[80%] p-5 rounded-xl shadow-sm text-sm md:text-base leading-relaxed ${
+              <div className={`max-w-[90%] md:max-w-[80%] p-4 md:p-5 rounded-2xl shadow-sm text-sm md:text-base leading-relaxed ${
                   msg.role === 'ai' ? 'bg-white border-l-4 border-yellow-400 text-gray-900' : 'bg-gray-900 text-white font-medium'
                 }`}
               >
-                {msg.image && (
-                  <div className="mb-3 text-xs opacity-80 flex items-center gap-1 font-mono bg-black/20 p-2 rounded w-fit">
-                    <Camera size={14} /> Załącznik: {msg.image} (Wysłano do wizji)
+                {/* Wymierny podgląd miniatury na czacie dla wysłanych zdjęć */}
+                {msg.imagePreview && (
+                  <div className="mb-3">
+                    <img 
+                      src={msg.imagePreview} 
+                      alt="Załącznik" 
+                      className="max-h-48 rounded-lg border border-gray-700 object-cover shadow-sm"
+                    />
+                    {msg.imageName && (
+                      <span className="text-[10px] opacity-60 font-mono mt-1 block">{msg.imageName}</span>
+                    )}
                   </div>
                 )}
                 
@@ -220,13 +306,78 @@ export default function AxonAI() {
         <div ref={messagesEndRef} />
       </div>
 
-      <div className="bg-white p-4 border-t border-gray-200 shadow-lg shrink-0">
-        <div className="max-w-4xl mx-auto flex items-center gap-3">
-          <label className="cursor-pointer p-3 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg transition-colors border border-gray-300">
-            <Upload size={20} />
-            <input type="file" accept="image/*" className="hidden" onChange={handleImageUpload} disabled={loading} />
-          </label>
+      <div className="bg-white p-3 md:p-4 border-t border-gray-200 shadow-lg shrink-0 relative">
+        
+        {/* PODGLĄD ZDJĘCIA PRZED WYSŁANIEM */}
+        {imagePreview && (
+          <div className="max-w-4xl mx-auto mb-3 flex items-center gap-3 bg-gray-50 p-2 rounded-xl border border-gray-200 w-fit relative group">
+            <img src={imagePreview} alt="Podgląd" className="w-14 h-14 object-cover rounded-lg border border-gray-300" />
+            <div className="pr-6">
+              <p className="text-xs font-bold text-gray-800 truncate max-w-[200px]">{image?.name || 'Obraz ze schowka'}</p>
+              <p className="text-[10px] text-green-600 font-semibold">Ready do analizy AI</p>
+            </div>
+            <button 
+              onClick={removeSelectedImage}
+              className="absolute -top-2 -right-2 bg-red-500 hover:bg-red-600 text-white p-1 rounded-full shadow-md transition-colors"
+            >
+              <X size={14} />
+            </button>
+          </div>
+        )}
 
+        {/* UKRYTE INPUTY DLA APARATU I GALERII */}
+        <input 
+          type="file" 
+          accept="image/*" 
+          ref={galleryInputRef} 
+          className="hidden" 
+          onChange={handleImageUpload} 
+          disabled={loading} 
+        />
+        <input 
+          type="file" 
+          accept="image/*" 
+          capture="environment" 
+          ref={cameraInputRef} 
+          className="hidden" 
+          onChange={handleImageUpload} 
+          disabled={loading} 
+        />
+
+        {/* ROZWIJANE MENU PLUSIKA (+) */}
+        {showPlusMenu && (
+          <div className="absolute bottom-20 left-4 md:left-auto bg-white border border-gray-200 rounded-2xl shadow-xl p-2 z-50 flex flex-col gap-1 w-52 animate-in fade-in slide-in-from-bottom-2">
+            <button
+              onClick={() => cameraInputRef.current?.click()}
+              className="flex items-center gap-3 p-2.5 hover:bg-yellow-50 text-gray-800 rounded-xl transition-colors font-medium text-xs text-left"
+            >
+              <div className="p-2 bg-yellow-100 text-yellow-700 rounded-lg"><Camera size={16} /></div>
+              <span>Zrób zdjęcie (Aparat)</span>
+            </button>
+            <button
+              onClick={() => galleryInputRef.current?.click()}
+              className="flex items-center gap-3 p-2.5 hover:bg-yellow-50 text-gray-800 rounded-xl transition-colors font-medium text-xs text-left"
+            >
+              <div className="p-2 bg-blue-100 text-blue-700 rounded-lg"><FileImage size={16} /></div>
+              <span>Wybierz z galerii / plik</span>
+            </button>
+          </div>
+        )}
+
+        <div className="max-w-4xl mx-auto flex items-center gap-2">
+          
+          {/* PRZYCISK PLUS (+) */}
+          <button
+            onClick={() => setShowPlusMenu(!showPlusMenu)}
+            disabled={loading}
+            className={`p-3 rounded-xl transition-colors border flex items-center justify-center shrink-0 ${
+              showPlusMenu ? 'bg-yellow-400 text-black border-yellow-500' : 'bg-gray-100 hover:bg-gray-200 text-gray-700 border-gray-300'
+            }`}
+          >
+            <Plus size={20} className={showPlusMenu ? 'rotate-45 transition-transform' : 'transition-transform'} />
+          </button>
+
+          {/* INPUT TEKSTOWY */}
           <input
             type="text"
             value={input}
@@ -234,22 +385,36 @@ export default function AxonAI() {
             onKeyDown={(e) => e.key === 'Enter' && handleSend()}
             onPaste={handlePaste} 
             disabled={loading}
-            placeholder={image ? `Załączono: ${image.name} - opisz problem...` : 'Zadaj pytanie lub wklej wycinek ze schematu (Ctrl+V)...'}
-            className="flex-1 p-3 bg-white text-gray-900 placeholder-gray-400 border border-gray-300 rounded-lg focus:outline-none focus:border-yellow-400 focus:ring-2 focus:ring-yellow-400 transition-all font-medium text-base"
+            placeholder={isListening ? 'Słucham... dyktuj teraz...' : 'Zapytaj lub wklej wycinek (Ctrl+V)...'}
+            className={`flex-1 p-3 bg-white text-gray-900 placeholder-gray-400 border rounded-xl focus:outline-none focus:border-yellow-400 focus:ring-2 focus:ring-yellow-400 transition-all font-medium text-sm md:text-base ${
+              isListening ? 'border-red-400 ring-2 ring-red-300' : 'border-gray-300'
+            }`}
           />
 
-          <button onClick={handleSend} disabled={(!input.trim() && !image) || loading} className="p-3 bg-yellow-400 hover:bg-yellow-500 disabled:bg-gray-300 disabled:cursor-not-allowed text-black font-bold rounded-lg transition-colors flex items-center gap-2 shadow-sm">
+          {/* PRZYCISK MIKROFONU */}
+          <button
+            onClick={toggleListening}
+            disabled={loading}
+            title={isListening ? 'Zatrzymaj dyktowanie' : 'Dyktuj mowę'}
+            className={`p-3 rounded-xl transition-colors border flex items-center justify-center shrink-0 ${
+              isListening 
+                ? 'bg-red-500 text-white border-red-600 animate-pulse' 
+                : 'bg-gray-100 hover:bg-gray-200 text-gray-700 border-gray-300'
+            }`}
+          >
+            {isListening ? <MicOff size={20} /> : <Mic size={20} />}
+          </button>
+
+          {/* PRZYCISK WYSŁANIA */}
+          <button 
+            onClick={handleSend} 
+            disabled={(!input.trim() && !image) || loading} 
+            className="p-3 bg-yellow-400 hover:bg-yellow-500 disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed text-black font-bold rounded-xl transition-colors flex items-center gap-2 shadow-sm shrink-0"
+          >
             <Send size={20} />
-            <span className="hidden sm:inline uppercase text-sm tracking-wider">Wyślij</span>
+            <span className="hidden sm:inline uppercase text-xs tracking-wider">Wyślij</span>
           </button>
         </div>
-
-        {image && (
-          <div className="max-w-4xl mx-auto text-xs text-green-700 font-bold mt-2 flex items-center justify-between bg-green-50 p-2 rounded border border-green-200">
-            <span>📷 Gotowe do wizji AI: {image.name}</span>
-            <button onClick={() => setImage(null)} className="text-red-500 hover:underline font-semibold">Usuń</button>
-          </div>
-        )}
       </div>
     </div>
   );
